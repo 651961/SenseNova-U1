@@ -1,33 +1,113 @@
 # SenseNova-U1 Infographic Model Series 📊
 
-This page summarizes model weights, benchmarks, and generation results for the SenseNova-U1 infographic model family.
+This page summarizes model weights, benchmarks, and generation results for the SenseNova-U1 infographic model family. **SenseNova-U1-8B-MoT-Infographic-V3** is the currently recommended release for an integrated infographic generation-and-editing workflow.
 
 ## Model Overview
 
-| Model | Notes |
-| :--- | :---- |
-| [SenseNova-U1-8B-MoT-Infographic-V2](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V2) | Recommended infographic model, improving small-text rendering, complex dense layout, and overall visual aesthetics while fixing the black-background issue. |
-| [SenseNova-U1-8B-MoT-Infographic](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic) | Infographic model based on SenseNova-U1-8B-MoT, strengthening complex infographic generation, text rendering, and background stability. |
+| Model | Positioning and Core Capabilities |
+| :--- | :--- |
+| [SenseNova-U1-8B-MoT-Infographic-V3](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V3) | **Currently recommended release** for integrated infographic generation and editing. Supports T2I and IT2I, with a stronger focus on infographic editing: it covers 10 editing tasks, including general infographic editing, single-reference style transfer, precise text replacement, single-image subject card generation, local defect/artifact fixing, bbox-constrained local editing, chart editing, layout element rearrangement, full-page structure reconstruction, and natural insertion within red-box masks. It also supports precise text repair in dense text regions while preserving the consistency of non-edited areas. |
+| [SenseNova-U1-8B-MoT-Infographic-V2](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V2) | Infographic T2I specialist, improving small-text rendering, complex dense layouts, and overall aesthetics while fixing the black-background issue. |
+| [SenseNova-U1-8B-MoT-Infographic](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic) | First infographic-specialized release, strengthening complex infographic generation, text rendering, and background stability across 100+ styles and layouts. |
 
-## SenseNova-U1-8B-MoT-Infographic-V2
+> V2 and V3 are independently trained from the same base model and optimized respectively for infographic generation and integrated generation-and-editing workflows.
 
-**SenseNova-U1-8B-MoT-Infographic-V2** is an upgraded version of **SenseNova-U1-8B-MoT-Infographic**. In the MT/SFT phases, we further optimized the training data composition by incorporating more and better high-quality synthetic/real data and rebalancing the distribution within infographic-related samples as well as their proportion relative to other data, with targeted improvements for small-text rendering, complex dense layouts, and high-aesthetic generation. During RL, we introduced DPO training to improve overall visual quality; in the GRPO stage, we continued optimizing the reward recipe so the model more reliably avoids unintended black or overly dark backgrounds.
+<details>
+<summary><b>Expand for training and capability details of each release</b></summary>
 
-- **Model Performance:** Compared with **SenseNova-U1-8B-MoT-Infographic**, V2 improves BizGenEval hard/easy from 46.6 / 65.4 to 50.3 / 67.9 (+3.7 / +2.5), and IGenBench Q-ACC/I-ACC from 69.5 / 17.0 to 71.4 / 18.3 (+1.9 / +1.3). OneIG(EN/ZH) is 55.4 / 53.5, roughly on par with the previous version, indicating that infographic-specific capability improves while general generation ability remains stable.
+### SenseNova-U1-8B-MoT-Infographic-V3
 
-- **Generation Quality:** V2 further improves small-text rendering, complex dense layout, and overall visual aesthetics: text edges are sharper, high-information-density layouts are more stable, and poster, dashboard, and report-style infographics look more polished. It also fixes the black-background issue, avoiding unintended black or overly dark backgrounds.
+**SenseNova-U1-8B-MoT-Infographic-V2** and **SenseNova-U1-8B-MoT-Infographic-V3** are independently trained from the same base model and optimized with different priorities. V2 primarily focuses on infographic text-to-image generation, while V3 targets an integrated infographic generation-and-editing workflow, preserving text-to-image (T2I) capability while significantly strengthening image editing (IT2I) capability.
 
-## SenseNova-U1-8B-MoT-Infographic
+To balance generation and editing capabilities, V3 restarts training from the MT stage with diverse infographic editing task data and jointly trains T2I and image-editing tasks at a reasonable ratio, followed by SFT and RL stages.
 
-**SenseNova-U1-8B-MoT-Infographic** is produced by extending the MT training phase on top of **SenseNova-U1-8B-MoT** and adjusting the data ratio between understanding and generation tasks during MT / SFT. During RL, we further optimized the reward recipe to reduce unintended black backgrounds in generated infographics.
+- **Model Performance:** V3 reaches an Overall Total of 50.23 on Qwen-Image-Bench, improving by 2.23 over V2's 48.00. It also achieves an Average of 5.89 on WeEdit and an overall score of 7.89 on GEdit-Bench, ranking first among the open-source models included in both evaluations.
+- **Generation Quality:** While retaining infographic T2I capability, V3 adds IT2I and supports either region-marked precise changes or natural-language-only editing. It handles localized text edits, local content insertion/removal/replacement, global style editing, and layout editing while preserving unedited regions whenever possible.
 
-- **Model Performance:** Compared with the base **SenseNova-U1-8B-MoT**, BizGenEval hard/easy improves from 39.8 / 61.1 to 46.6 / 65.4 (+6.8 / +4.3), and IGenBench Q-ACC/I-ACC improves from 51.3 / 4.2 to 69.5 / 17.0 (+18.2 / +12.8). The model also maintains robust visual understanding capability without noticeable degradation.
+### SenseNova-U1-8B-MoT-Infographic-V2
 
-- **Generation Quality:** The model can generate complex infographics across 100+ styles and layouts, with improved visual aesthetics and text rendering, including dense small-text scenarios such as arXiv-style pages.
+V2 upgrades the previous release by incorporating more high-quality synthetic and real data during MT/SFT and rebalancing both the distribution within infographic samples and their ratio to other data. This targets small-text rendering, complex dense layouts, and high-aesthetic generation. During RL, DPO improves overall visual quality; during GRPO, further reward-recipe optimization reduces unintended black or overly dark backgrounds.
+
+- **Model Performance:** BizGenEval hard/easy improves from 46.6 / 65.4 to 50.3 / 67.9 (+3.7 / +2.5), while IGenBench Q-ACC/I-ACC improves from 69.5 / 17.0 to 71.4 / 18.3 (+1.9 / +1.3). OneIG(EN/ZH) reaches 55.4 / 53.5, roughly matching the previous release.
+- **Generation Quality:** Text edges are sharper, high-information-density layouts are more stable, and poster, dashboard, and report-style infographics look more polished. The release also fixes the black-background issue.
+
+### SenseNova-U1-8B-MoT-Infographic
+
+The first infographic-specialized release extends MT training from **SenseNova-U1-8B-MoT**, adjusts the data ratio between understanding and generation tasks during MT/SFT, and further optimizes the reward recipe during RL to reduce unintended black backgrounds.
+
+- **Model Performance:** BizGenEval hard/easy improves from 39.8 / 61.1 to 46.6 / 65.4 (+6.8 / +4.3), while IGenBench Q-ACC/I-ACC improves from 51.3 / 4.2 to 69.5 / 17.0 (+18.2 / +12.8), with robust visual understanding retained.
+- **Generation Quality:** Supports complex infographics across 100+ styles and layouts, improving visual aesthetics and text rendering in dense small-text scenarios such as arXiv-style pages.
+
+</details>
 
 ## Benchmark Results
 
-| Model | BizGenEval Avg. (hard / easy) ↑ | IGenBench Q-ACC ↑ | IGenBench I-ACC ↑ | OneIG(EN) ↑ | OneIG(ZH) ↑ |
+### WeEdit (Image Editing)
+
+| Model | Instruction Adherence&nbsp;↑ | Text Clarity&nbsp;↑ | Background Preservation&nbsp;↑ | Average&nbsp;↑ |
+| :--- | ---: | ---: | ---: | ---: |
+| ***Closed-source Models*** | | | | |
+| Nano-Banana-Pro | **8.58** | **9.10** | **8.85** | **8.84** |
+| Seedream 4.5 | 6.29 | 7.66 | 6.38 | 6.78 |
+| Gemini-2.5-Flash-Image | 3.92 | 7.14 | 7.80 | 6.29 |
+| Qwen-Image-2.0 | 5.04 | 6.08 | 5.68 | 5.60 |
+| ***Open-source Models*** | | | | |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | **5.67** | 5.94 | 6.06 | **5.89** |
+| FireRed-Image-Edit | 4.15 | **6.33** | **7.14** | 5.87 |
+| HY-Image-3-Instruct | 4.16 | 5.99 | 7.03 | 5.73 |
+| Qwen-Image-Edit-2509 | 3.49 | 5.84 | 6.80 | 5.38 |
+| LongCat-Image-Edit | 2.78 | 4.36 | 7.03 | 4.72 |
+| Qwen-Image-Edit-2511 | 3.18 | 3.93 | 4.63 | 3.91 |
+| BAGEL | 1.97 | 4.01 | 5.75 | 3.91 |
+
+<sub>Note: Higher is better. Group-best scores are bolded. Average is the arithmetic mean of the three metrics. V3 ranks first by Average among the open-source models included in this evaluation.</sub>
+
+### GEdit-Bench (Image Editing)
+
+| Model | EN_G_SC&nbsp;↑ | EN_G_PQ&nbsp;↑ | EN_G_O&nbsp;↑ |
+| :--- | ---: | ---: | ---: |
+| ***Closed-source Models*** | | | |
+| Qwen-Image-2.0 | **9.02** | 8.02 | **8.37** |
+| UniWorld-V2 | 8.39 | 8.02 | 7.83 |
+| Seedream 4.5 | 8.27 | 8.17 | 7.82 |
+| Nano-Banana-Pro | 8.10 | 8.34 | 7.74 |
+| Seedream 4.0 | 8.14 | 8.12 | 7.70 |
+| Nano-Banana | 7.40 | **8.45** | 7.29 |
+| ***Open-source Models*** | | | |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | **8.65** | 7.58 | **7.89** |
+| LongCat-Image-Edit | 8.18 | **8.00** | 7.64 |
+| Qwen-Image-Edit-2511 | 8.00 | 7.86 | 7.56 |
+| Qwen-Image-Edit-2509 | 8.15 | 7.86 | 7.54 |
+| Step1X-Edit | 7.66 | 7.35 | 6.97 |
+| BAGEL | 7.36 | 6.83 | 6.52 |
+| OmniGen2 | 7.16 | 6.77 | 6.41 |
+| UniWorld-v1 | 4.93 | 7.43 | 4.85 |
+| AnyEdit | 3.18 | 5.82 | 3.21 |
+
+<sub>Note: Higher is better. Group-best scores are bolded. V3 delivers the best overall performance among the open-source models.</sub>
+
+
+### Qwen-Image-Bench (Text-to-Image)
+
+| Model | Quality&nbsp;↑ | Aesthetics&nbsp;↑ | Alignment&nbsp;↑ | Real-world Fidelity&nbsp;↑ | Creative Generation&nbsp;↑ | Overall Total&nbsp;↑ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-Image-2 | **59.09** | **68.48** | **65.78** | **59.40** | **75.34** | **64.58** |
+| Nano-Banana-Pro | 55.30 | 61.38 | 60.30 | 55.91 | 64.54 | 57.84 |
+| Qwen-Image-2.0 | 55.16 | 60.36 | 57.86 | 53.06 | 63.59 | 57.84 |
+| HunyuanImage-3.0 | 50.76 | 54.66 | 53.16 | 45.33 | 48.33 | 50.81 |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | 49.53 | 52.82 | 52.00 | 44.32 | 48.34 | 50.23 |
+| SenseNova-U1-8B-MoT-Infographic-V2 | 48.15 | 49.60 | 50.08 | 43.68 | 44.65 | 48.00 |
+| SenseNova-U1-8B-MoT-Infographic | 47.12 | 48.15 | 48.90 | 43.35 | 45.40 | 47.11 |
+| HiDream-O1 | 44.20 | 45.35 | 43.74 | 40.28 | 36.24 | 42.84 |
+
+<sub>Note: Higher is better. Column-best scores and the V3 model name are bolded. V3 reaches an Overall Total of 50.23, improving by 2.23 over V2's 48.00.</sub>
+
+### Historical Infographic Generation Benchmarks
+
+<details>
+<summary><b>Expand for complete BizGenEval, IGenBench, and OneIG results</b></summary>
+
+| Model | BizGenEval Avg. (hard / easy)&nbsp;↑ | IGenBench Q-ACC&nbsp;↑ | IGenBench I-ACC&nbsp;↑ | OneIG(EN)&nbsp;↑ | OneIG(ZH)&nbsp;↑ |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | ***Commercial Models*** | | 
 | Nano-Banana-Pro | 76.7 / 93.7 | 90.6 | 48.8 | 58.1 | 56.8 |
@@ -36,7 +116,8 @@ This page summarizes model weights, benchmarks, and generation results for the S
 | Qwen-Image-2.0 | 45.5 / 65.8 | 50.0 | 3.0 | 54.1 | 50.9 |
 | Seedream-4.5 | 30.1 / 66.2 | 61.0 | 6.0 | 56.4 | 55.0 |
 | ***Open-source Models*** | | | | | |
-| **SenseNova-U1-8B-MoT-Infographic-V2** | **50.3 / 67.9** | **71.4** | **18.3** | 55.4 | 53.5 |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | 49.5 / **68.5** | 66.3 | 13.2 | 54.6 | 52.4 |
+| **SenseNova-U1-8B-MoT-Infographic-V2** | **50.3** / 67.9 | **71.4** | **18.3** | 55.4 | 53.5 |
 | **SenseNova-U1-8B-MoT-Infographic** | 46.6 / 65.4 | 69.5 | 17.0 | **55.6** | 53.3 |
 | **SenseNova-U1-8B-MoT** | 39.8 / 61.1 | 51.3 | 4.2 | 54.5 | 53.8 |
 | Z-Image | 8.2 / 43.8 | 30.0 | 1.0 | 54.6 | 53.5 |
@@ -44,7 +125,188 @@ This page summarizes model weights, benchmarks, and generation results for the S
 | Qwen-Image | 2.8 / 23.8 | 36.0 | 0.0 | 53.9 | 54.8 |
 | Bagel | 2.0 / 3.7 | 4.9 | 0.0 | 36.1 | 37.0 |
 
-<sub>Note: IGenBench scores are reported as percentages. Commercial and open-source models are sorted separately by the average of BizGenEval hard/easy and IGenBench Q-ACC/I-ACC. OneIG is included as a general generation reference.</sub>
+<sub>Note: V3 is the current release and is pinned to the first row of the open-source section. IGenBench scores are reported as percentages; the remaining commercial and open-source models are sorted separately by the average of BizGenEval hard/easy and IGenBench Q-ACC/I-ACC. OneIG is included as a general generation reference.</sub>
+
+V2 and V3 are independently trained from the same base model with different task and data mixtures. V3 jointly trains infographic text-to-image generation and image editing with a slightly lower proportion of chart-related training data than V2, resulting in lower IGenBench scores than the generation-focused V2. At the same time, V3 remains broadly comparable to V2 on BizGenEval, improves the broader Qwen-Image-Bench score from 48.00 to 50.23, and delivers a clear improvement in infographic editing capability.
+
+</details>
+
+## SenseNova-U1-8B-MoT-Infographic-V3 Showcase
+
+The following V3 examples are organized around integrated infographic generation-and-editing capabilities. They cover T2I generation and IT2I editing scenarios, including four major editing capability groups: local text editing, local content editing, global style editing, and global layout editing, and demonstrate precise dense-text repair and consistency preservation in non-edited regions.
+
+### Local Text Editing
+
+#### Region-Marked Precise Editing
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">Instruction</th>
+<th width="36%" align="left">Before Edit</th>
+<th width="36%" align="left">After Edit</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将蓝色框中的屋顶变为红色，将红框中的标题改为比较简短的格式，将绿框中的屋子改为红色屋顶的咖啡屋，将紫色框中改为共享自行车站，将粉色框中的内容改为书柜，将右下角青色框中的内容改为，室内植物玻璃房</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/bbc1e512-b947-4a7f-a2bf-219716b57e47" alt="V3 edit showcase 26 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/ec2479e2-3aa4-4b8a-850b-64c6ccd5e73d" alt="V3 edit showcase 26 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把红色框的“经典·从容·每一刻”换成经典时尚手表，蓝色框换成“100米防水”，橙色框换成电池寿命约10年</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/05802591-b36b-49fc-93aa-e625ca29af8e" alt="V3 edit showcase 03 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7eb76c56-af18-4025-aec4-1feb6417d164" alt="V3 edit showcase 03 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">修复红框内模糊标题为“量子互联网的第一条链路”，去掉红框，其余不动。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d7bc06a3-db7e-4fd2-802c-71a7489bde7a" alt="V3 edit showcase 04 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/08631c76-390c-448c-81fd-5d087b0fa7fd" alt="V3 edit showcase 04 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">请在图像中红色边界框标出的空白区域内插入指定内容，并使新增内容与真实环境的材质、透视、光照和空间关系自然融合。<br>目标区域：<br>“画面左下角主面板下方的空白深色区域，位于左侧四个数据卡片下方、底部图表左侧的红色边界框内部”<br>需要插入的文字或内容为：<br>“年度结余目标：120,000元”<br>请严格将新增内容限制在红框内部。完成插入后，需要彻底去除红色边界框，使最终图像中不再显示任何红线、控制点、箭头或编辑标记。<br>在插入内容之前，请先分析目标区域的实际环境，包括：<br>深色金融仪表盘背景的平面方向；<br>目标区域的矩形仪表盘面板边界；<br>玻璃拟态卡片、深色渐变背景和细线边框材质；<br>光源方向和亮度；<br>环境阴影与微弱高光；<br>字体应该像金融仪表盘中的数字标签和状态卡片，而不是普通贴纸文字。<br>新增文字必须按照目标表面的透视自然放置。由于目标区域是正面仪表盘平面，文字应保持水平排版、居中或左对齐，并与原有卡片网格对齐。<br>新增内容的颜色、亮度和清晰度必须符合环境光照。建议使用浅色文字配合绿色或金色强调数字，使其与原图“储蓄率 41%”“目标完成 76%”等数据卡片风格一致。不能使用与场景完全无关的纯白贴字，也不能让文字看起来悬浮在表面前方。<br>如果目标区域是仪表盘卡片：<br>文字应在红框内部合理居中；<br>保留原有深色面板边缘、微弱发光和阴影；<br>不得覆盖相邻卡片、图表或边框；<br>可以根据原有设计加入适当内边距和小型图标。<br>插入的文字必须完整、清晰、无乱码、无错别字。字体风格应与金融仪表盘和数据卡片用途相符，不得使用与场景冲突的字体。<br>除红框内部区域和红框本身之外，图像中的其他内容必须保持完全不变。不得移动标题“个人年度财务仪表盘”、左侧数据卡、现金流图、储蓄仪表、支出分类图、目标追踪列表或任何其他物体，不得改变整体光照、颜色和构图。<br>不得扩大目标区域，不得把新增内容放到红框外，也不得保留红框作为最终设计元素。<br>最重要的是，新增内容必须像原本就存在于该金融仪表盘中，而不是后来粘贴上去。最终画面应具有正确的材质融合、环境光照、卡片层级和自然对齐关系。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/fd54835f-44fe-46a3-948e-27f974553a90" alt="V3 edit showcase 05 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f5b9dfc2-0aa2-40eb-98fe-136efd49c850" alt="V3 edit showcase 05 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将原西班牙语标题替换为英文“STOP USING SHOWER SPONGES!”和副标题“YOUR SKIN DESERVES BETTER”，移除红框，框外所有文字、人物、颜色和布局完全不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/95f80cb9-0784-4b6b-bacf-9861fa9bb274" alt="V3 edit showcase 06 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/a1569284-f926-488c-a6c9-c9fe2c72b79f" alt="V3 edit showcase 06 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">翻译红框中的内容</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/fd532f0a-12ac-4eb8-9cb9-99c755f54596" alt="V3 edit showcase 07 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/5c347441-83e7-4bca-9812-3c2febddd670" alt="V3 edit showcase 07 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把红色框的“我不见，黄河之水地下来”替换成“君不见，黄河之水天上来”，把蓝色框的“我不见，高堂明镜悲白发”替换成“君不见，高堂明镜悲白发”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/da548cba-72bc-474f-8dbb-1b14d84e8c68" alt="V3 edit showcase 08 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/38d4121e-44b2-4c6d-bb1b-d0307720937e" alt="V3 edit showcase 08 output" width="100%"></td>
+</tr>
+</table>
+
+#### Natural-Language Prompt Editing
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">Instruction</th>
+<th width="36%" align="left">Before Edit</th>
+<th width="36%" align="left">After Edit</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">主题风格换成漫画风格，需要进行以下修改：<br>第一项修改：将原图中的文字：“STYLE”替换为：“时尚杂志”<br>第二项修改：将原图中的文字：“FORWARD”替换为：“美丽的补充力”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d828ad2e-dc25-41dc-b4fa-09c6430cf602" alt="V3 edit showcase 01 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/886a00d5-8b33-405d-84a1-0d6b1ec466fc" alt="V3 edit showcase 01 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;"><br>第一项修改：将原图中的文字：“不够高级“替换为：“DESIGN！OR  DIE！”第二项修改：将原图中的文字：“没有惊喜感”，换成“缺乏设计感会导致”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6668849d-6200-4bdd-bd0f-9c942a5858a9" alt="V3 edit showcase 09 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/a6bb0c48-7f53-4978-8cfe-06c0a96e879a" alt="V3 edit showcase 09 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;"><br>第一项修改：将原图中的文字：“城市低碳生活地图”替换为：“城市绿色出行地图”第二项修改：将原图中的文字：“绿色出行 42%”替换为：“绿色出行 56%”第三项修改：将位于画面右上角卡片中的“节能建筑 36栋”，调整为“低碳建筑 48栋”。第四项修改：删除文字“社区回收 18站”中的“社区”，保留为“回收 18站”，并确保删除后语句自然、排版完整。第五项修改：修正原图中的数据：“公共绿地 128公顷”修改为“公共绿地 156公顷”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/12d33583-2451-43b0-bf81-96059e2eaf3e" alt="V3 edit showcase 10 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/09d654dd-f43c-4a44-91bb-8aff15663b0c" alt="V3 edit showcase 10 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把“主要航海壮举”换成“主要事件”，把“地理大发现时代”换成“！！地理大发现时期！！”，把“克里斯托弗·哥伦布”，换成“Cristóbal Colón”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/611832d7-a8c7-44e1-9370-15b8f2d888ce" alt="V3 edit showcase 18 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f5465b9a-6ef6-42b9-aaad-ab5ae50e50c7" alt="V3 edit showcase 18 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把“人类进化史”换成“人类——我们的故事”，把“概述”换成“总结”，把“主要进化阶段”换成“演化路径”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/12dd48dc-1a75-41ca-a6b5-e33bf5cd75ed" alt="V3 edit showcase 19 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/eadbd53f-65ae-43a6-80f8-6556ed0da8d7" alt="V3 edit showcase 19 output" width="100%"></td>
+</tr>
+</table>
+
+### Local Content Editing
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">Instruction</th>
+<th width="36%" align="left">Before Edit</th>
+<th width="36%" align="left">After Edit</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">删除海面下的塑料袋、塑料瓶和吸管，将中央口号改为白色手写体“SAVE OUR OCEAN”，把右侧海龟移到文字下方并在底部新增回收标志，保持海洋分层结构清晰。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/3c6b175d-5319-4086-b557-9494b9957f41" alt="V3 edit showcase 02 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7bc71122-4daa-4d26-bd9a-c6ef7d3cf6fa" alt="V3 edit showcase 02 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">透明杯壁上加入“CURLY &amp; PROUD”，文字需随杯面弧度自然变形，并呈现透过玻璃与茶水后的透明度和色偏。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6415a2b5-be35-4a26-8ab1-d2ad1dad2b8f" alt="V3 edit showcase 11 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/e6c5c364-9e43-4f3b-918a-404f68aa713c" alt="V3 edit showcase 11 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">复古电脑屏幕内加入绿色单色像素字“DESIGN MODE: ON”，匹配屏幕透视、颗粒噪点与玻璃反光；</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/1051f104-7155-4744-aede-a4d8d91f4a29" alt="V3 edit showcase 12 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/dc63618b-375c-458d-958c-ba553443483e" alt="V3 edit showcase 12 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将四代员工使用个人AI工具的比例依次改为：Gen Z 92%、Millennials 81%、Gen X 68%、Boomers 55%，并同步调整四根彩色柱子的高度。保留人物插画、英文标题、配色纹理、来源和品牌信息不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/627f4998-cadd-4890-b265-46ece2c5b52b" alt="V3 edit showcase 13 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/00320589-4760-44b1-b52f-e77b6dd4b867" alt="V3 edit showcase 13 output" width="100%"></td>
+</tr>
+<tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">在顶部蓝色标题区右上角自然加入一枚金黄色奖杯徽章，奖杯内写“TOP GROWTH”，采用与原图一致的扁平矢量风格、粗线条和蓝黄配色，并添加少量庆祝星光装饰。调整徽章大小避免遮挡“2023 HIGHLIGHTS”，其他文字、数据、插画和布局保持不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/83ef4291-4b31-4aff-bd64-a211cbe7d7cd" alt="V3 edit showcase 16 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/1d6ecedc-838b-4daf-b16d-5cbe51277c92" alt="V3 edit showcase 16 output" width="100%"></td>
+</tr>
+</table>
+
+### Global Style Editing
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">Instruction</th>
+<th width="36%" align="left">Before Edit</th>
+<th width="36%" align="left">After Edit</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">主题风格换成乐高风格。将原图中的文字：“2022“替换为：“2025”第二项修改：将原图中的文字：“FINESTBUSINESSTRENDS”换成“HELLO！ WORLD！”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/9a4889be-ba56-4952-bc84-682f31bd86c7" alt="V3 edit showcase 17 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6a4c1a30-cb2b-40d7-a26e-ff46a4628999" alt="V3 edit showcase 17 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把图片风格换成乐高风格和中国春节风格，所有文字换成像素字体。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/bee3637e-a452-40bf-b610-bfa7561e6975" alt="V3 edit showcase 20 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/8370e414-1be9-482b-8fce-24f3ddcf438e" alt="V3 edit showcase 20 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将顶部主标题“城市应急避险指挥图”替换为“城市防汛应急联动图”。风格换成赛博朋克风格。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d5b2191f-44e6-494e-aa02-9451c4a406c5" alt="V3 edit showcase 21 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/2d2437ff-ffd3-4e94-bd13-8c75b50db2aa" alt="V3 edit showcase 21 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把图片风格换成中国传统风格。字体换成宋体</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/8e9254a7-041b-4591-b624-23121fd9a5e5" alt="V3 edit showcase 22 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/652069f7-65f5-4479-9279-c51f2bb250ff" alt="V3 edit showcase 22 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">保持内容不变，迁移为亮色风格</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6d0595cc-7c75-43ed-8f7a-f59f9dba70f2" alt="V3 edit showcase 23 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f7b2310a-fc49-411d-be5f-242b586ad6f0" alt="V3 edit showcase 23 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">风格换成复古羊皮纸地图风；保留全部文字、数据与版式。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7d53cde2-f182-487d-acf1-7eba7b0aa117" alt="V3 edit showcase 24 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/39ed9c3f-1756-4389-a472-6ffd47f0e2ac" alt="V3 edit showcase 24 output" width="100%"></td>
+</tr>
+</table>
+
+### Global Layout Editing
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">Instruction</th>
+<th width="36%" align="left">Before Edit</th>
+<th width="36%" align="left">After Edit</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>Instruction</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">信息大致不变，对布局进行美化</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/28ac52b2-1518-4234-ab76-26884dc9f8cd" alt="V3 edit showcase 25 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/0338f4ff-5f76-4f8c-91b2-71087bb503f9" alt="V3 edit showcase 25 output" width="100%"></td>
+</tr>
+</table>
 
 ## SenseNova-U1-8B-MoT-Infographic-V2 Showcase
 

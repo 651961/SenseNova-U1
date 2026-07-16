@@ -1,33 +1,112 @@
 # SenseNova-U1 信息图模型系列 📊
 
-本页汇总 SenseNova-U1 信息图模型系列的权重、评测和生成效果。
+本页汇总 SenseNova-U1 信息图模型系列的权重、评测和生成效果。**SenseNova-U1-8B-MoT-Infographic-V3** 是面向信息图生成与编辑一体化场景的当前推荐版本。
 
 ## 模型概览
 
-| 模型 | 说明 |
+| 模型 | 版本定位与核心能力 |
 | :--- | :--- |
-| [SenseNova-U1-8B-MoT-Infographic-V2](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V2) | 推荐使用的信息图模型，提升小字渲染、复杂密集排版和整体美观度，并修复背景变黑问题。 |
-| [SenseNova-U1-8B-MoT-Infographic](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic) |  基于 SenseNova-U1-8B-MoT 的信息图模型，强化复杂信息图生成、文字渲染和背景稳定性。 |
+| [SenseNova-U1-8B-MoT-Infographic-V3](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V3) | **当前推荐版本**；面向信息图生成与编辑一体化场景，支持 T2I 与 IT2I，重点增强了信息图编辑能力：覆盖常规信息图编辑、单参考风格迁移、精确文本替换、单图主体卡片生成、局部缺陷/伪影修复、带框局部修改、图表编辑、版面元素重排、整页结构重构、红框掩码自然插入等 10 类编辑任务，并支持在密集文本中精确的修复文字，保持非编辑部分的一致性。 |
+| [SenseNova-U1-8B-MoT-Infographic-V2](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic-V2) | 信息图 T2I 专项版本；重点提升小字渲染、复杂密集排版和整体美观度，并修复背景变黑问题。 |
+| [SenseNova-U1-8B-MoT-Infographic](https://huggingface.co/sensenova/SenseNova-U1-8B-MoT-Infographic) | 首个信息图专项版本；强化复杂信息图生成、文字渲染和背景稳定性，支持 100+ 种风格与布局。 |
 
-## SenseNova-U1-8B-MoT-Infographic-V2
 
-**SenseNova-U1-8B-MoT-Infographic-V2** 是 **SenseNova-U1-8B-MoT-Infographic** 的升级版本。在 MT/SFT 阶段，我们通过引入更多更好的高质量合成/真实数据，并重新平衡信息图相关样本内分布以及和其他数据分布，进一步优化训练数据组成，针对小字渲染、复杂密集排版和高美观度生成能力进行重点提升。在 RL 阶段，我们引入 DPO 训练以提升整体视觉质量；在 GRPO 阶段，继续优化 reward recipe，使模型更稳定地避免非预期黑底或过暗背景。
+<details>
+<summary><b>展开查看各版本的训练与能力说明</b></summary>
 
-- **模型性能：** 相比 **SenseNova-U1-8B-MoT-Infographic**，V2 在 BizGenEval hard/easy 上从 46.6 / 65.4 提升到 50.3 / 67.9（+3.7 / +2.5），IGenBench Q-ACC/I-ACC 从 69.5 / 17.0 提升到 71.4 / 18.3（+1.9 / +1.3）。OneIG(EN/ZH) 为 55.4 / 53.5，与上一版基本持平，说明信息图专项能力提升的同时，通用生成能力保持稳定。
+### SenseNova-U1-8B-MoT-Infographic-V3
 
-- **生成质量：** V2 进一步提升小字渲染、复杂密集排版和整体美观度：小字边缘更加锐利，高信息密度版面组织更稳定，海报、看板、报告类信息图的视觉效果更精致。同时，该模型修复了背景变黑问题，避免非预期黑底或过暗背景。
+**SenseNova-U1-8B-MoT-Infographic-V2** 与 **SenseNova-U1-8B-MoT-Infographic-V3** 均从同一基础模型出发独立训练，并面向不同目标进行重点优化。V2 主要聚焦信息图文生图；V3 则面向信息图生成与编辑一体化场景，保留文生图（T2I）能力不下降的同时，并重点增强图像编辑（IT2I）能力。
 
-## SenseNova-U1-8B-MoT-Infographic
+为兼顾生成与编辑能力，V3 从 MT 阶段重新启动训练，构建多样的信息图编辑任务数据，并按合理比例联合训练 T2I 与图像编辑任务，随后进入 SFT 和 RL 阶段。
 
-**SenseNova-U1-8B-MoT-Infographic** 是在 U1-8B-MoT 模型基础上延长了 MT 阶段训练，并在 MT 与 SFT 阶段调整了理解和生成任务中的数据配比产生的模型。在 RL 阶段，我们进一步优化了 reward recipe，以减少生成信息图中非预期黑色背景的出现。
+- **模型性能：** Qwen-Image-Bench Overall Total 为 50.23，相比 V2 的 48.00 提升 2.23；WeEdit Average 为 5.89，GEdit-Bench 综合得分为 7.89，均在本次评测的开源模型中排名第一。
+- **生成质量：** V3 在保留信息图 T2I 能力的同时新增 IT2I 能力，既可通过标记目标区域定点修改，也可仅使用自然语言指令进行编辑；支持局部文字修改、局部内容插入/删除/替换、全局风格编辑和布局编辑，同时尽可能保持未编辑区域不变。
 
-- **模型性能：** 相比基础模型 **SenseNova-U1-8B-MoT**，BizGenEval hard/easy 从 39.8 / 61.1 提升到 46.6 / 65.4（+6.8 / +4.3），IGenBench Q-ACC/I-ACC 从 51.3 / 4.2 提升到 69.5 / 17.0（+18.2 / +12.8）。同时，模型仍保持稳健的视觉理解能力，没有出现明显退化。
+### SenseNova-U1-8B-MoT-Infographic-V2
 
-- **生成质量：** 模型能够生成涵盖 100+ 种风格与布局的复杂信息图，具备更优的视觉美观度与文字渲染能力 —— 甚至能够渲染如 arXiv 风格页面等高密度小字。
+V2 是上一版本的升级版本。在 MT/SFT 阶段，我们引入更多高质量合成与真实数据，重新平衡信息图样本内部及其与其他数据之间的分布，重点优化小字渲染、复杂密集排版和高美观度生成。在 RL 阶段，我们引入 DPO 以提升整体视觉质量；在 GRPO 阶段继续优化 reward recipe，减少非预期黑底或过暗背景。
+
+- **模型性能：** BizGenEval hard/easy 从 46.6 / 65.4 提升到 50.3 / 67.9（+3.7 / +2.5），IGenBench Q-ACC/I-ACC 从 69.5 / 17.0 提升到 71.4 / 18.3（+1.9 / +1.3）；OneIG(EN/ZH) 为 55.4 / 53.5，与上一版基本持平。
+- **生成质量：** 小字边缘更加锐利，高信息密度版面组织更稳定，海报、看板和报告类信息图更加精致，并修复了背景变黑问题。
+
+### SenseNova-U1-8B-MoT-Infographic
+
+首个信息图专项版本在 **SenseNova-U1-8B-MoT** 基础上延长 MT 训练，并在 MT/SFT 阶段调整理解与生成任务的数据配比；在 RL 阶段进一步优化 reward recipe，减少生成信息图中的非预期黑色背景。
+
+- **模型性能：** BizGenEval hard/easy 从 39.8 / 61.1 提升到 46.6 / 65.4（+6.8 / +4.3），IGenBench Q-ACC/I-ACC 从 51.3 / 4.2 提升到 69.5 / 17.0（+18.2 / +12.8），同时保持稳健的视觉理解能力。
+- **生成质量：** 支持 100+ 种风格与布局的复杂信息图，提升视觉美观度和文字渲染能力，可处理 arXiv 风格页面等高密度小字场景。
+
+</details>
 
 ## 评测结果
 
-| 模型 | BizGenEval Avg. (hard / easy) ↑ | IGenBench Q-ACC ↑ | IGenBench I-ACC ↑ | OneIG(EN) ↑ | OneIG(ZH) ↑ |
+### WeEdit（图像编辑）
+
+| 模型 | Instruction Adherence&nbsp;↑ | Text Clarity&nbsp;↑ | Background Preservation&nbsp;↑ | Average&nbsp;↑ |
+| :--- | ---: | ---: | ---: | ---: |
+| ***闭源模型*** | | | | |
+| Nano-Banana-Pro | **8.58** | **9.10** | **8.85** | **8.84** |
+| Seedream 4.5 | 6.29 | 7.66 | 6.38 | 6.78 |
+| Gemini-2.5-Flash-Image | 3.92 | 7.14 | 7.80 | 6.29 |
+| Qwen-Image-2.0 | 5.04 | 6.08 | 5.68 | 5.60 |
+| ***开源模型*** | | | | |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | **5.67** | 5.94 | 6.06 | **5.89** |
+| FireRed-Image-Edit | 4.15 | **6.33** | **7.14** | 5.87 |
+| HY-Image-3-Instruct | 4.16 | 5.99 | 7.03 | 5.73 |
+| Qwen-Image-Edit-2509 | 3.49 | 5.84 | 6.80 | 5.38 |
+| LongCat-Image-Edit | 2.78 | 4.36 | 7.03 | 4.72 |
+| Qwen-Image-Edit-2511 | 3.18 | 3.93 | 4.63 | 3.91 |
+| BAGEL | 1.97 | 4.01 | 5.75 | 3.91 |
+
+<sub>注：越高越好；粗体为组内最高分，Average 为三项指标的算术平均值。V3 的 Average 在本次评测的开源模型中排名第一。</sub>
+
+### GEdit-Bench（图像编辑）
+
+| 模型 | EN_G_SC&nbsp;↑ | EN_G_PQ&nbsp;↑ | EN_G_O&nbsp;↑ |
+| :--- | ---: | ---: | ---: |
+| ***闭源模型*** | | | |
+| Qwen-Image-2.0 | **9.02** | 8.02 | **8.37** |
+| UniWorld-V2 | 8.39 | 8.02 | 7.83 |
+| Seedream 4.5 | 8.27 | 8.17 | 7.82 |
+| Nano-Banana-Pro | 8.10 | 8.34 | 7.74 |
+| Seedream 4.0 | 8.14 | 8.12 | 7.70 |
+| Nano-Banana | 7.40 | **8.45** | 7.29 |
+| ***开源模型*** | | | |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | **8.65** | 7.58 | **7.89** |
+| LongCat-Image-Edit | 8.18 | **8.00** | 7.64 |
+| Qwen-Image-Edit-2511 | 8.00 | 7.86 | 7.56 |
+| Qwen-Image-Edit-2509 | 8.15 | 7.86 | 7.54 |
+| Step1X-Edit | 7.66 | 7.35 | 6.97 |
+| BAGEL | 7.36 | 6.83 | 6.52 |
+| OmniGen2 | 7.16 | 6.77 | 6.41 |
+| UniWorld-v1 | 4.93 | 7.43 | 4.85 |
+| AnyEdit | 3.18 | 5.82 | 3.21 |
+
+<sub>注：越高越好；粗体为组内最高分。V3 在开源模型中综合表现最优。</sub>
+
+
+### Qwen-Image-Bench（文生图）
+
+| 模型 | Quality&nbsp;↑ | Aesthetics&nbsp;↑ | Alignment&nbsp;↑ | Real-world Fidelity&nbsp;↑ | Creative Generation&nbsp;↑ | Overall Total&nbsp;↑ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-Image-2 | **59.09** | **68.48** | **65.78** | **59.40** | **75.34** | **64.58** |
+| Nano-Banana-Pro | 55.30 | 61.38 | 60.30 | 55.91 | 64.54 | 57.84 |
+| Qwen-Image-2.0 | 55.16 | 60.36 | 57.86 | 53.06 | 63.59 | 57.84 |
+| HunyuanImage-3.0 | 50.76 | 54.66 | 53.16 | 45.33 | 48.33 | 50.81 |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | 49.53 | 52.82 | 52.00 | 44.32 | 48.34 | 50.23 |
+| SenseNova-U1-8B-MoT-Infographic-V2 | 48.15 | 49.60 | 50.08 | 43.68 | 44.65 | 48.00 |
+| SenseNova-U1-8B-MoT-Infographic | 47.12 | 48.15 | 48.90 | 43.35 | 45.40 | 47.11 |
+| HiDream-O1 | 44.20 | 45.35 | 43.74 | 40.28 | 36.24 | 42.84 |
+
+<sub>注：越高越好；各列最高分加粗，V3 模型名加粗。V3 的 Overall Total 为 50.23，相比 V2 的 48.00 提升 2.23。</sub>
+
+### 历史信息图生成评测
+
+<details>
+<summary><b>展开查看 BizGenEval、IGenBench 与 OneIG 完整结果</b></summary>
+
+| 模型 | BizGenEval Avg. (hard / easy)&nbsp;↑ | IGenBench Q-ACC&nbsp;↑ | IGenBench I-ACC&nbsp;↑ | OneIG(EN)&nbsp;↑ | OneIG(ZH)&nbsp;↑ |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | ***Commercial Models*** | | 
 | Nano-Banana-Pro | 76.7 / 93.7 | 90.6 | 48.8 | 58.1 | 56.8 |
@@ -36,7 +115,8 @@
 | Qwen-Image-2.0 | 45.5 / 65.8 | 50.0 | 3.0 | 54.1 | 50.9 |
 | Seedream-4.5 | 30.1 / 66.2 | 61.0 | 6.0 | 56.4 | 55.0 |
 | ***Open-source Models*** | | | | | |
-| **SenseNova-U1-8B-MoT-Infographic-V2** | **50.3 / 67.9** | **71.4** | **18.3** | 55.4 | 53.5 |
+| **SenseNova-U1-8B-MoT-Infographic-V3** | 49.5 / **68.5** | 66.3 | 13.2 | 54.6 | 52.4 |
+| **SenseNova-U1-8B-MoT-Infographic-V2** | **50.3** / 67.9 | **71.4** | **18.3** | 55.4 | 53.5 |
 | **SenseNova-U1-8B-MoT-Infographic** | 46.6 / 65.4 | 69.5 | 17.0 | **55.6** | 53.3 |
 | **SenseNova-U1-8B-MoT** | 39.8 / 61.1 | 51.3 | 4.2 | 54.5 | 53.8 |
 | Z-Image | 8.2 / 43.8 | 30.0 | 1.0 | 54.6 | 53.5 |
@@ -44,8 +124,188 @@
 | Qwen-Image | 2.8 / 23.8 | 36.0 | 0.0 | 53.9 | 54.8 |
 | Bagel | 2.0 / 3.7 | 4.9 | 0.0 | 36.1 | 37.0 |
 
-<sub>注：IGenBench 指标按百分制展示；商业模型与开源模型分别按 BizGenEval hard/easy、IGenBench Q-ACC/I-ACC 四项平均分排序。OneIG 仅作为通用生成能力参考。</sub>
+<sub>注：V3 为当前发布版本，固定列于开源模型首行。IGenBench 指标按百分制展示；其余商业模型与开源模型分别按 BizGenEval hard/easy、IGenBench Q-ACC/I-ACC 四项平均分排序。OneIG 仅作为通用生成能力参考。</sub>
 
+V2 与 V3 从同一基础模型出发独立训练，并采用不同的任务与数据配比。V3 联合训练信息图文生图和图像编辑任务，图表相关训练数据占比略低于 V2，因此其 IGenBench 分数低于以信息图生成为主要目标的 V2。与此同时，V3 在 BizGenEval 上与 V2 基本持平，在覆盖更广泛文生图能力的 Qwen-Image-Bench 上由 48.00 提升至 50.23，并在信息图编辑能力上有明显提升。
+
+</details>
+
+## SenseNova-U1-8B-MoT-Infographic-V3 案例展示
+
+以下 V3 案例围绕信息图生成与编辑一体化能力展开，覆盖 T2I 生成及 IT2I 编辑场景，包括局部文字编辑、局部内容编辑、全局风格编辑、全局布局编辑等 4 大类编辑能力，并展示其在密集文本精确修复和非编辑区域一致性保持方面的效果。
+
+### 局部文字编辑
+
+#### 标注目标区域进行定点修改
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">指令</th>
+<th width="36%" align="left">编辑前</th>
+<th width="36%" align="left">编辑后</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将蓝色框中的屋顶变为红色，将红框中的标题改为比较简短的格式，将绿框中的屋子改为红色屋顶的咖啡屋，将紫色框中改为共享自行车站，将粉色框中的内容改为书柜，将右下角青色框中的内容改为，室内植物玻璃房</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/bbc1e512-b947-4a7f-a2bf-219716b57e47" alt="V3 edit showcase 26 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/ec2479e2-3aa4-4b8a-850b-64c6ccd5e73d" alt="V3 edit showcase 26 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把红色框的“经典·从容·每一刻”换成经典时尚手表，蓝色框换成“100米防水”，橙色框换成电池寿命约10年</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/05802591-b36b-49fc-93aa-e625ca29af8e" alt="V3 edit showcase 03 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7eb76c56-af18-4025-aec4-1feb6417d164" alt="V3 edit showcase 03 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">修复红框内模糊标题为“量子互联网的第一条链路”，去掉红框，其余不动。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d7bc06a3-db7e-4fd2-802c-71a7489bde7a" alt="V3 edit showcase 04 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/08631c76-390c-448c-81fd-5d087b0fa7fd" alt="V3 edit showcase 04 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">请在图像中红色边界框标出的空白区域内插入指定内容，并使新增内容与真实环境的材质、透视、光照和空间关系自然融合。<br>目标区域：<br>“画面左下角主面板下方的空白深色区域，位于左侧四个数据卡片下方、底部图表左侧的红色边界框内部”<br>需要插入的文字或内容为：<br>“年度结余目标：120,000元”<br>请严格将新增内容限制在红框内部。完成插入后，需要彻底去除红色边界框，使最终图像中不再显示任何红线、控制点、箭头或编辑标记。<br>在插入内容之前，请先分析目标区域的实际环境，包括：<br>深色金融仪表盘背景的平面方向；<br>目标区域的矩形仪表盘面板边界；<br>玻璃拟态卡片、深色渐变背景和细线边框材质；<br>光源方向和亮度；<br>环境阴影与微弱高光；<br>字体应该像金融仪表盘中的数字标签和状态卡片，而不是普通贴纸文字。<br>新增文字必须按照目标表面的透视自然放置。由于目标区域是正面仪表盘平面，文字应保持水平排版、居中或左对齐，并与原有卡片网格对齐。<br>新增内容的颜色、亮度和清晰度必须符合环境光照。建议使用浅色文字配合绿色或金色强调数字，使其与原图“储蓄率 41%”“目标完成 76%”等数据卡片风格一致。不能使用与场景完全无关的纯白贴字，也不能让文字看起来悬浮在表面前方。<br>如果目标区域是仪表盘卡片：<br>文字应在红框内部合理居中；<br>保留原有深色面板边缘、微弱发光和阴影；<br>不得覆盖相邻卡片、图表或边框；<br>可以根据原有设计加入适当内边距和小型图标。<br>插入的文字必须完整、清晰、无乱码、无错别字。字体风格应与金融仪表盘和数据卡片用途相符，不得使用与场景冲突的字体。<br>除红框内部区域和红框本身之外，图像中的其他内容必须保持完全不变。不得移动标题“个人年度财务仪表盘”、左侧数据卡、现金流图、储蓄仪表、支出分类图、目标追踪列表或任何其他物体，不得改变整体光照、颜色和构图。<br>不得扩大目标区域，不得把新增内容放到红框外，也不得保留红框作为最终设计元素。<br>最重要的是，新增内容必须像原本就存在于该金融仪表盘中，而不是后来粘贴上去。最终画面应具有正确的材质融合、环境光照、卡片层级和自然对齐关系。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/fd54835f-44fe-46a3-948e-27f974553a90" alt="V3 edit showcase 05 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f5b9dfc2-0aa2-40eb-98fe-136efd49c850" alt="V3 edit showcase 05 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将原西班牙语标题替换为英文“STOP USING SHOWER SPONGES!”和副标题“YOUR SKIN DESERVES BETTER”，移除红框，框外所有文字、人物、颜色和布局完全不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/95f80cb9-0784-4b6b-bacf-9861fa9bb274" alt="V3 edit showcase 06 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/a1569284-f926-488c-a6c9-c9fe2c72b79f" alt="V3 edit showcase 06 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">翻译红框中的内容</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/fd532f0a-12ac-4eb8-9cb9-99c755f54596" alt="V3 edit showcase 07 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/5c347441-83e7-4bca-9812-3c2febddd670" alt="V3 edit showcase 07 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把红色框的“我不见，黄河之水地下来”替换成“君不见，黄河之水天上来”，把蓝色框的“我不见，高堂明镜悲白发”替换成“君不见，高堂明镜悲白发”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/da548cba-72bc-474f-8dbb-1b14d84e8c68" alt="V3 edit showcase 08 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/38d4121e-44b2-4c6d-bb1b-d0307720937e" alt="V3 edit showcase 08 output" width="100%"></td>
+</tr>
+</table>
+
+#### 通过自然语言 Prompt 直接指定需要修改
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">指令</th>
+<th width="36%" align="left">编辑前</th>
+<th width="36%" align="left">编辑后</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">主题风格换成漫画风格，需要进行以下修改：<br>第一项修改：将原图中的文字：“STYLE”替换为：“时尚杂志”<br>第二项修改：将原图中的文字：“FORWARD”替换为：“美丽的补充力”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d828ad2e-dc25-41dc-b4fa-09c6430cf602" alt="V3 edit showcase 01 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/886a00d5-8b33-405d-84a1-0d6b1ec466fc" alt="V3 edit showcase 01 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;"><br>第一项修改：将原图中的文字：“不够高级“替换为：“DESIGN！OR  DIE！”第二项修改：将原图中的文字：“没有惊喜感”，换成“缺乏设计感会导致”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6668849d-6200-4bdd-bd0f-9c942a5858a9" alt="V3 edit showcase 09 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/a6bb0c48-7f53-4978-8cfe-06c0a96e879a" alt="V3 edit showcase 09 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;"><br>第一项修改：将原图中的文字：“城市低碳生活地图”替换为：“城市绿色出行地图”第二项修改：将原图中的文字：“绿色出行 42%”替换为：“绿色出行 56%”第三项修改：将位于画面右上角卡片中的“节能建筑 36栋”，调整为“低碳建筑 48栋”。第四项修改：删除文字“社区回收 18站”中的“社区”，保留为“回收 18站”，并确保删除后语句自然、排版完整。第五项修改：修正原图中的数据：“公共绿地 128公顷”修改为“公共绿地 156公顷”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/12d33583-2451-43b0-bf81-96059e2eaf3e" alt="V3 edit showcase 10 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/09d654dd-f43c-4a44-91bb-8aff15663b0c" alt="V3 edit showcase 10 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把“主要航海壮举”换成“主要事件”，把“地理大发现时代”换成“！！地理大发现时期！！”，把“克里斯托弗·哥伦布”，换成“Cristóbal Colón”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/611832d7-a8c7-44e1-9370-15b8f2d888ce" alt="V3 edit showcase 18 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f5465b9a-6ef6-42b9-aaad-ab5ae50e50c7" alt="V3 edit showcase 18 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把“人类进化史”换成“人类——我们的故事”，把“概述”换成“总结”，把“主要进化阶段”换成“演化路径”。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/12dd48dc-1a75-41ca-a6b5-e33bf5cd75ed" alt="V3 edit showcase 19 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/eadbd53f-65ae-43a6-80f8-6556ed0da8d7" alt="V3 edit showcase 19 output" width="100%"></td>
+</tr>
+</table>
+
+### 局部内容编辑
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">指令</th>
+<th width="36%" align="left">编辑前</th>
+<th width="36%" align="left">编辑后</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">删除海面下的塑料袋、塑料瓶和吸管，将中央口号改为白色手写体“SAVE OUR OCEAN”，把右侧海龟移到文字下方并在底部新增回收标志，保持海洋分层结构清晰。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/3c6b175d-5319-4086-b557-9494b9957f41" alt="V3 edit showcase 02 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7bc71122-4daa-4d26-bd9a-c6ef7d3cf6fa" alt="V3 edit showcase 02 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">透明杯壁上加入“CURLY &amp; PROUD”，文字需随杯面弧度自然变形，并呈现透过玻璃与茶水后的透明度和色偏。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6415a2b5-be35-4a26-8ab1-d2ad1dad2b8f" alt="V3 edit showcase 11 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/e6c5c364-9e43-4f3b-918a-404f68aa713c" alt="V3 edit showcase 11 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">复古电脑屏幕内加入绿色单色像素字“DESIGN MODE: ON”，匹配屏幕透视、颗粒噪点与玻璃反光；</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/1051f104-7155-4744-aede-a4d8d91f4a29" alt="V3 edit showcase 12 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/dc63618b-375c-458d-958c-ba553443483e" alt="V3 edit showcase 12 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将四代员工使用个人AI工具的比例依次改为：Gen Z 92%、Millennials 81%、Gen X 68%、Boomers 55%，并同步调整四根彩色柱子的高度。保留人物插画、英文标题、配色纹理、来源和品牌信息不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/627f4998-cadd-4890-b265-46ece2c5b52b" alt="V3 edit showcase 13 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/00320589-4760-44b1-b52f-e77b6dd4b867" alt="V3 edit showcase 13 output" width="100%"></td>
+</tr>
+<tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">在顶部蓝色标题区右上角自然加入一枚金黄色奖杯徽章，奖杯内写“TOP GROWTH”，采用与原图一致的扁平矢量风格、粗线条和蓝黄配色，并添加少量庆祝星光装饰。调整徽章大小避免遮挡“2023 HIGHLIGHTS”，其他文字、数据、插画和布局保持不变。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/83ef4291-4b31-4aff-bd64-a211cbe7d7cd" alt="V3 edit showcase 16 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/1d6ecedc-838b-4daf-b16d-5cbe51277c92" alt="V3 edit showcase 16 output" width="100%"></td>
+</tr>
+</table>
+
+### 全局风格编辑
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">指令</th>
+<th width="36%" align="left">编辑前</th>
+<th width="36%" align="left">编辑后</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">主题风格换成乐高风格。将原图中的文字：“2022“替换为：“2025”第二项修改：将原图中的文字：“FINESTBUSINESSTRENDS”换成“HELLO！ WORLD！”</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/9a4889be-ba56-4952-bc84-682f31bd86c7" alt="V3 edit showcase 17 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6a4c1a30-cb2b-40d7-a26e-ff46a4628999" alt="V3 edit showcase 17 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把图片风格换成乐高风格和中国春节风格，所有文字换成像素字体。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/bee3637e-a452-40bf-b610-bfa7561e6975" alt="V3 edit showcase 20 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/8370e414-1be9-482b-8fce-24f3ddcf438e" alt="V3 edit showcase 20 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">将顶部主标题“城市应急避险指挥图”替换为“城市防汛应急联动图”。风格换成赛博朋克风格。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/d5b2191f-44e6-494e-aa02-9451c4a406c5" alt="V3 edit showcase 21 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/2d2437ff-ffd3-4e94-bd13-8c75b50db2aa" alt="V3 edit showcase 21 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">把图片风格换成中国传统风格。字体换成宋体</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/8e9254a7-041b-4591-b624-23121fd9a5e5" alt="V3 edit showcase 22 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/652069f7-65f5-4479-9279-c51f2bb250ff" alt="V3 edit showcase 22 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">保持内容不变，迁移为亮色风格</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/6d0595cc-7c75-43ed-8f7a-f59f9dba70f2" alt="V3 edit showcase 23 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/f7b2310a-fc49-411d-be5f-242b586ad6f0" alt="V3 edit showcase 23 output" width="100%"></td>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">风格换成复古羊皮纸地图风；保留全部文字、数据与版式。</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/7d53cde2-f182-487d-acf1-7eba7b0aa117" alt="V3 edit showcase 24 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/39ed9c3f-1756-4389-a472-6ffd47f0e2ac" alt="V3 edit showcase 24 output" width="100%"></td>
+</tr>
+</table>
+
+### 全局布局编辑
+
+<table width="100%" style="table-layout: fixed;">
+<tr>
+<th width="28%" align="left">指令</th>
+<th width="36%" align="left">编辑前</th>
+<th width="36%" align="left">编辑后</th>
+</tr>
+<tr>
+<td valign="top" width="28%"><details><summary><b>指令</b></summary><div style="margin-top: 8px; font-size: 0.9em; line-height: 1.5;">信息大致不变，对布局进行美化</div></details></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/28ac52b2-1518-4234-ab76-26884dc9f8cd" alt="V3 edit showcase 25 input" width="100%"></td>
+<td valign="top" width="36%"><img src="https://github.com/user-attachments/assets/0338f4ff-5f76-4f8c-91b2-71087bb503f9" alt="V3 edit showcase 25 output" width="100%"></td>
+</tr>
+</table>
 
 ## SenseNova-U1-8B-MoT-Infographic-V2 案例展示
 
