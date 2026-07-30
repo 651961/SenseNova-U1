@@ -20,9 +20,9 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 
 # ============================ Model & data (placeholders — fill in!) ============================ #
 export CONFIG_NAME="configs/sensenovavl_qwen3_gen/sensenovau1_8b_mot_sft.py"
-export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/path/to/SenseNova-U1-8B-MoT-SFT"}
-export VOCAB_FILE=${VOCAB_FILE:-"/path/to/qwen3/tokenizer"}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-"/path/to/qwen3/tokenizer"}
+export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
+export VOCAB_FILE=${VOCAB_FILE:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
 export mm_data_path=${mm_data_path:-"data/sample/sample_data_meta.json"}
 export load_optimizer=${load_optimizer:-"model"}
 

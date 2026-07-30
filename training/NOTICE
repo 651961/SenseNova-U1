@@ -32,6 +32,9 @@ from which upstream and under what license.
 - NVIDIA Apex (https://github.com/NVIDIA/apex)
   Copyright (c) NVIDIA Corporation. Licensed under BSD-3-Clause.
 
+- Liger Kernel (https://github.com/linkedin/Liger-Kernel)
+  Copyright (c) 2024 LinkedIn Corporation. Licensed under BSD-2-Clause.
+
 - Megatron-LM (https://github.com/NVIDIA/Megatron-LM)
   Copyright (c) NVIDIA Corporation. Licensed under a permissive license
   (see upstream LICENSE; Apache-2.0 compatible).

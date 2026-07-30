@@ -6,7 +6,9 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from liger_kernel.transformers.functional import liger_swiglu
 
+from sensenovalm.model.ops.swiglu import fused_gate_up_swiglu
 from sensenovalm.utils.logger import get_logger
 
 logger = get_logger(__file__)
@@ -25,7 +27,13 @@ def is_gate_param(param: torch.Tensor) -> bool:
 
 
 def Silu(w1_o, w2_o):
-    return F.silu(w1_o) * w2_o
+    """Apply SwiGLU with Liger's fused Triton forward/backward kernels."""
+    return liger_swiglu(w1_o, w2_o)
+
+
+def SiluFused(gate_up):
+    """Apply SwiGLU directly to a fused ``[gate, up]`` projection."""
+    return fused_gate_up_swiglu(gate_up)
 
 
 def Gelu(w1_o, w2_o):

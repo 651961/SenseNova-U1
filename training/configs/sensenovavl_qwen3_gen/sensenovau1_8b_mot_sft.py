@@ -180,8 +180,8 @@ if llm_data_config is not None:
 # Checkpoint
 # -----------------------------------------------------------------------------
 SAVE_CKPT_FOLDER = f"local:RUN/{JOB_NAME}"
-CHECKPOINT_EVERY = 100             # full ckpt save every N train steps
-CHECKPOINT_SNAPSHOT_EVERY = 1000   # snapshot ckpt save every N train steps
+CHECKPOINT_EVERY = 2000            # full ckpt save every N train steps
+CHECKPOINT_SNAPSHOT_EVERY = 250    # snapshot ckpt save every N train steps
 
 ckpt = dict(
     enable_save_ckpt=True,
@@ -305,7 +305,7 @@ model = dict(
     embed_grad_scale=1,
     embed_split_hidden=True,
     parallel_output=True,
-    mlp_layer_fusion=False,
+    mlp_layer_fusion=True,
     attention_selective_checkpoint=False,
     num_chunks=1,
     # activation checkpointing fraction: True/False/[0-1]

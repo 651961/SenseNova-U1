@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from sensenovalm.model.modules.linear import new_linear
-from sensenovalm.model.modules.utils import Gelu, Silu
+from sensenovalm.model.modules.utils import Gelu, Silu, SiluFused
 from sensenovalm.utils.logger import get_logger
 from sensenovalm.utils.utils import ActivationType
 
@@ -112,14 +112,21 @@ class FeedForward(nn.Module):
         if not self.mlp_layer_fusion:
             w1_o = self.w1(x)
             w3_o = self.w3(x)
-        else:
-            fussed_out = self.fused_w1_w3(x)
-            w1_o, w3_o = torch.split(fussed_out, fussed_out.shape[-1] // 2, dim=-1)
 
-        if self.activation_type is ActivationType.swiglu.name:
-            out = self.w2(Silu(w1_o, w3_o))
+            if self.activation_type == ActivationType.swiglu.name:
+                hidden = Silu(w1_o, w3_o)
+            else:
+                hidden = Gelu(w1_o, w3_o)
         else:
-            out = self.w2(Gelu(w1_o, w3_o))
+            fused_out = self.fused_w1_w3(x)
+
+            if self.activation_type == ActivationType.swiglu.name:
+                hidden = SiluFused(fused_out)
+            else:
+                w1_o, w3_o = torch.split(fused_out, fused_out.shape[-1] // 2, dim=-1)
+                hidden = Gelu(w1_o, w3_o)
+
+        out = self.w2(hidden)
 
         return out
 
