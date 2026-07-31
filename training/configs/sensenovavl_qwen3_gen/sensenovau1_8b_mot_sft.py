@@ -306,6 +306,7 @@ model = dict(
     embed_split_hidden=True,
     parallel_output=True,
     mlp_layer_fusion=True,
+    enable_qkv_fusion=env_bool('enable_qkv_fusion', True),
     attention_selective_checkpoint=False,
     num_chunks=1,
     # activation checkpointing fraction: True/False/[0-1]

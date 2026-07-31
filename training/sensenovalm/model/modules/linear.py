@@ -12,6 +12,7 @@ Linear Modules
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -192,10 +193,14 @@ class WPFusedDenseFunc(torch.autograd.Function):
         total_weight = communicator.weight_hook(weight, module=module)
         total_bias = bias if bias is None else communicator.weight_hook(bias, module=module, is_bias=True)
 
+        total_weight = _convert_fused_weight_layout(total_weight, module, to_compute_layout=True)
+        if total_bias is not None:
+            total_bias = _convert_fused_weight_layout(total_bias, module, to_compute_layout=True)
+
         if torch.is_autocast_enabled():
             total_weight = total_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            if total_bias:
-                total_bias.to(dtype=torch.get_autocast_gpu_dtype())
+            if total_bias is not None:
+                total_bias = total_bias.to(dtype=torch.get_autocast_gpu_dtype())
 
         total_weight = total_weight.contiguous()
         batch_shape, n = x.shape[:-1], x.shape[-1]
@@ -243,6 +248,7 @@ class WPFusedDenseFunc(torch.autograd.Function):
         grad_output = grad_output.reshape(batch_dim, grad_output.shape[-1])
 
         total_weight = communicator.weight_hook(weight, module=module)
+        total_weight = _convert_fused_weight_layout(total_weight, module, to_compute_layout=True).contiguous()
 
         is_using_ZB = (
             gpc.is_using_parallel_mode(ParallelMode.PIPELINE)
@@ -257,8 +263,13 @@ class WPFusedDenseFunc(torch.autograd.Function):
             if is_using_ZB:
                 from sensenovalm.core.scheduler.pipeline_scheduler import WeightGradStore
 
+                grad_compute_func = linear_bias_wgrad_op
+                grad_hook = communicator.grad_hook
+                if getattr(module, "_fused_weight_split_sizes", None) is not None:
+                    grad_compute_func = partial(_linear_bias_wgrad_with_fused_layout, module=module)
+                    grad_hook = partial(communicator.grad_hook, module=module)
                 WeightGradStore.put(
-                    weight, bias, x, grad_output, ctx.needs_input_grad[2], linear_bias_wgrad_op, communicator.grad_hook
+                    weight, bias, x, grad_output, ctx.needs_input_grad[2], grad_compute_func, grad_hook
                 )
                 grad_weight, grad_bias = None, None
             else:
@@ -267,6 +278,10 @@ class WPFusedDenseFunc(torch.autograd.Function):
                     grad_output,
                     ctx.needs_input_grad[2],
                 )
+
+                grad_weight = _convert_fused_weight_layout(grad_weight, module, to_compute_layout=False)
+                if grad_bias is not None:
+                    grad_bias = _convert_fused_weight_layout(grad_bias, module, to_compute_layout=False)
 
                 grad_weight, grad_weight_sync = communicator.grad_hook(
                     grad_weight, async_op=True, module=module, is_bias=False
@@ -548,6 +563,75 @@ def fused_dense_func(
                 batch_sizes,
                 backend,
             )
+
+
+def _convert_fused_weight_layout(
+    tensor: torch.Tensor,
+    module: Optional[nn.Module],
+    *,
+    to_compute_layout: bool,
+) -> torch.Tensor:
+    """Convert between rank-major checkpoint shards and block-major GEMM rows.
+
+    Weight parallelism gathers equally sized local shards in rank order.  A
+    fused projection loaded from split parameters therefore has the global
+    layout ``[part0_r0, part1_r0, ..., part0_r1, part1_r1, ...]``.  GEMM
+    consumers generally need ``[all_part0, all_part1, ...]`` so their output
+    can be split without copying long-sequence activations.
+
+    Modules opt in by setting ``_fused_weight_split_sizes`` to the global row
+    counts of their logical parts.  The inverse conversion is applied to full
+    weight gradients before reduce-scatter, keeping the runtime/checkpoint
+    shard layout unchanged.
+    """
+    split_sizes = getattr(module, "_fused_weight_split_sizes", None) if module is not None else None
+    if split_sizes is None:
+        return tensor
+
+    split_sizes = tuple(int(size) for size in split_sizes)
+    full_rows = sum(split_sizes)
+    local_rows = module.weight.shape[0]
+    if tensor.shape[0] != full_rows or full_rows % local_rows != 0:
+        raise ValueError(
+            "Invalid fused weight layout: "
+            f"tensor rows={tensor.shape[0]}, full rows={full_rows}, local rows={local_rows}"
+        )
+
+    shard_count = full_rows // local_rows
+    if any(size % shard_count != 0 for size in split_sizes):
+        raise ValueError(
+            f"Fused weight parts {split_sizes} must be divisible by shard count {shard_count}"
+        )
+    if shard_count == 1:
+        return tensor
+
+    trailing_shape = tensor.shape[1:]
+    local_split_sizes = tuple(size // shard_count for size in split_sizes)
+    if to_compute_layout:
+        rank_major = tensor.reshape(shard_count, local_rows, *trailing_shape)
+        local_parts = rank_major.split(local_split_sizes, dim=1)
+        return torch.cat([part.flatten(0, 1) for part in local_parts], dim=0)
+
+    global_parts = tensor.split(split_sizes, dim=0)
+    rank_parts = [
+        part.reshape(shard_count, local_size, *trailing_shape)
+        for part, local_size in zip(global_parts, local_split_sizes)
+    ]
+    return torch.cat(rank_parts, dim=1).reshape_as(tensor)
+
+
+def _linear_bias_wgrad_with_fused_layout(
+    x: torch.Tensor,
+    grad_output: torch.Tensor,
+    has_bias: bool,
+    *,
+    module: nn.Module,
+):
+    grad_weight, grad_bias = linear_bias_wgrad_op(x, grad_output, has_bias)
+    grad_weight = _convert_fused_weight_layout(grad_weight, module, to_compute_layout=False)
+    if grad_bias is not None:
+        grad_bias = _convert_fused_weight_layout(grad_bias, module, to_compute_layout=False)
+    return grad_weight, grad_bias
 
 
 class ParallelLinearWithCommExt(nn.Linear):

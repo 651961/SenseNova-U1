@@ -109,6 +109,47 @@ def _qkv_save_convert(module: "GQA", state_dict, prefix: str, *args, **kwargs) -
     return state_dict
 
 
+def _mot_qkv_pre_load_convert(
+    module: "SWA_MoT", state_dict, prefix: str, *args, **kwargs  # pylint: disable=W0613
+) -> None:
+    """Load the existing split-QKV checkpoint schema into fused runtime weights."""
+    for branch_suffix in ("", "_mot_gen"):
+        for tensor_kind in ("weight", "bias"):
+            q_name = f"{prefix}wq{branch_suffix}.{tensor_kind}"
+            k_name = f"{prefix}wk{branch_suffix}.{tensor_kind}"
+            v_name = f"{prefix}wv{branch_suffix}.{tensor_kind}"
+            fused_name = f"{prefix}wqkv{branch_suffix}.{tensor_kind}"
+
+            if fused_name in state_dict:
+                continue
+            if not all(name in state_dict for name in (q_name, k_name, v_name)):
+                continue
+
+            state_dict[fused_name] = torch.cat(
+                (state_dict.pop(q_name), state_dict.pop(k_name), state_dict.pop(v_name)), dim=0
+            )
+
+
+def _mot_qkv_save_convert(
+    module: "SWA_MoT", state_dict, prefix: str, *args, **kwargs  # pylint: disable=W0613
+) -> Dict:
+    """Keep saved checkpoints and HF conversion compatible with split Q/K/V keys."""
+    for branch_suffix in ("", "_mot_gen"):
+        for tensor_kind in ("weight", "bias"):
+            fused_name = f"{prefix}wqkv{branch_suffix}.{tensor_kind}"
+            if fused_name not in state_dict:
+                continue
+
+            q_name = f"{prefix}wq{branch_suffix}.{tensor_kind}"
+            k_name = f"{prefix}wk{branch_suffix}.{tensor_kind}"
+            v_name = f"{prefix}wv{branch_suffix}.{tensor_kind}"
+            state_dict[q_name], state_dict[k_name], state_dict[v_name] = split_fused_wqkv_weight(
+                state_dict.pop(fused_name), q_dim=module.q_dim, kv_dim=module.kv_dim
+            )
+
+    return state_dict
+
+
 class MHA(nn.Module):
     """
     Multi-head self-attention and cross-attention.
@@ -1285,6 +1326,7 @@ class SWA_MoT(nn.Module):
         tp_mode: str = "mtp",
         qk_interleaved: Optional[bool] = True,
         use_logn_attn: bool = False,  # Qwen1
+        enable_qkv_fusion: bool = False,
     ) -> None:
         assert embed_dim % num_heads == 0, "embedding dim must be divisible by num_heads"
         assert (not use_sliding_window) or (
@@ -1300,7 +1342,13 @@ class SWA_MoT(nn.Module):
         self.head_dim = head_dim
         self.q_dim = self.head_dim * self.num_heads
         self.num_kv_heads = num_kv_heads
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+            )
+        self.q_per_kv = self.num_heads // self.num_kv_heads
         self.kv_dim = self.head_dim * num_kv_heads
+        self.enable_qkv_fusion = enable_qkv_fusion
         self.causal = causal
         self.layer_idx = layer_idx
         self.use_dynamic_ntk_rope = use_dynamic_ntk_rope
@@ -1338,54 +1386,24 @@ class SWA_MoT(nn.Module):
                 rotary_type="dynamic_ntk" if self.use_dynamic_ntk_rope else "native",
             )
 
-        # notice here should change bias=True
-        self.wq = new_linear(
-            "wq",
-            embed_dim,
-            self.q_dim,  
-            qkv_bias,
-            **factory_kwargs,
-        )
+        if self.enable_qkv_fusion:
+            fused_qkv_dim = self.q_dim + 2 * self.kv_dim
+            self.wqkv = new_linear("wqkv", embed_dim, fused_qkv_dim, qkv_bias, **factory_kwargs)
+            self.wqkv_mot_gen = new_linear("wqkv", embed_dim, fused_qkv_dim, qkv_bias, **factory_kwargs)
+            fused_weight_splits = (self.q_dim, self.kv_dim, self.kv_dim)
+            self.wqkv._fused_weight_split_sizes = fused_weight_splits
+            self.wqkv_mot_gen._fused_weight_split_sizes = fused_weight_splits
+            self._register_load_state_dict_pre_hook(_mot_qkv_pre_load_convert, with_module=True)
+            self._register_state_dict_hook(_mot_qkv_save_convert)
+        else:
+            # Split projections remain available as a numerical/performance fallback.
+            self.wq = new_linear("wq", embed_dim, self.q_dim, qkv_bias, **factory_kwargs)
+            self.wk = new_linear("wk", embed_dim, self.kv_dim, qkv_bias, **factory_kwargs)
+            self.wv = new_linear("wv", embed_dim, self.kv_dim, qkv_bias, **factory_kwargs)
 
-        self.wk = new_linear(
-            "wk",
-            embed_dim,
-            self.kv_dim,
-            qkv_bias,
-            **factory_kwargs,
-        )
-
-        self.wv = new_linear(
-            "wv",
-            embed_dim,
-            self.kv_dim,
-            qkv_bias,
-            **factory_kwargs,
-        )
-
-        self.wq_mot_gen = new_linear(
-            "wq",
-            embed_dim,
-            self.q_dim,  
-            qkv_bias,
-            **factory_kwargs,
-        )
-
-        self.wk_mot_gen = new_linear(
-            "wk",
-            embed_dim,
-            self.kv_dim,
-            qkv_bias,
-            **factory_kwargs,
-        )
-
-        self.wv_mot_gen = new_linear(
-            "wv",
-            embed_dim,
-            self.kv_dim,
-            qkv_bias,
-            **factory_kwargs,
-        )
+            self.wq_mot_gen = new_linear("wq", embed_dim, self.q_dim, qkv_bias, **factory_kwargs)
+            self.wk_mot_gen = new_linear("wk", embed_dim, self.kv_dim, qkv_bias, **factory_kwargs)
+            self.wv_mot_gen = new_linear("wv", embed_dim, self.kv_dim, qkv_bias, **factory_kwargs)
 
         self.use_qk_norm = use_qk_norm
         if use_qk_norm:
@@ -1447,16 +1465,39 @@ class SWA_MoT(nn.Module):
         else:
             return self._inference(x=x, inference_params=inference_params, **kwargs)
 
+    def _split_fused_qkv_output(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if qkv.shape[-1] % (self.q_per_kv + 2) != 0:
+            raise ValueError(
+                f"Fused QKV output width {qkv.shape[-1]} is incompatible with q_per_kv={self.q_per_kv}"
+            )
+        output_kv_dim = qkv.shape[-1] // (self.q_per_kv + 2)
+        output_q_dim = self.q_per_kv * output_kv_dim
+        q, k, v = qkv.split((output_q_dim, output_kv_dim, output_kv_dim), dim=-1)
+        q = rearrange(q, "b t (h d) -> b t h d", d=self.head_dim)
+        k = rearrange(k, "b t (h d) -> b t h d", d=self.head_dim)
+        v = rearrange(v, "b t (h d) -> b t h d", d=self.head_dim).contiguous()
+        return q, k, v
+
     def _training(self, x, position_embeddings: Tuple[torch.Tensor, torch.Tensor], image_gen_indicators, exist_non_image_gen_tokens, exist_image_gen_tokens, **kwargs):        
         num_image_gen_tokens = image_gen_indicators.sum().item()
 
-        q = torch.cat([self.wq_mot_gen(x[:, :num_image_gen_tokens]), self.wq(x[:, num_image_gen_tokens:])], 1)
-        k = torch.cat([self.wk_mot_gen(x[:, :num_image_gen_tokens]), self.wk(x[:, num_image_gen_tokens:])], 1)
-        v = torch.cat([self.wv_mot_gen(x[:, :num_image_gen_tokens]), self.wv(x[:, num_image_gen_tokens:])], 1)
+        if self.enable_qkv_fusion:
+            qkv = torch.cat(
+                [
+                    self.wqkv_mot_gen(x[:, :num_image_gen_tokens]),
+                    self.wqkv(x[:, num_image_gen_tokens:]),
+                ],
+                dim=1,
+            )
+            q, k, v = self._split_fused_qkv_output(qkv)
+        else:
+            q = torch.cat([self.wq_mot_gen(x[:, :num_image_gen_tokens]), self.wq(x[:, num_image_gen_tokens:])], 1)
+            k = torch.cat([self.wk_mot_gen(x[:, :num_image_gen_tokens]), self.wk(x[:, num_image_gen_tokens:])], 1)
+            v = torch.cat([self.wv_mot_gen(x[:, :num_image_gen_tokens]), self.wv(x[:, num_image_gen_tokens:])], 1)
 
-        q = rearrange(q, "b t (h d) -> b t h d", d=self.head_dim)
-        k = rearrange(k, "b t (h d) -> b t h d", d=self.head_dim)
-        v = rearrange(v, "b t (h d) -> b t h d", d=self.head_dim)
+            q = rearrange(q, "b t (h d) -> b t h d", d=self.head_dim)
+            k = rearrange(k, "b t (h d) -> b t h d", d=self.head_dim)
+            v = rearrange(v, "b t (h d) -> b t h d", d=self.head_dim)
 
         kv_seq_len = v.size(0)
         use_window_circumstance = (

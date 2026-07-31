@@ -93,6 +93,7 @@ class Qwen3MoeMoTDecoder(nn.Module):
         mlp_bias=False,
         norm_type: str = "rmsnorm",
         qk_interleaved: bool = False,
+        enable_qkv_fusion: bool = False,
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
@@ -159,6 +160,7 @@ class Qwen3MoeMoTDecoder(nn.Module):
             use_sliding_window=use_sliding_window,
             sliding_window=sliding_window,
             use_logn_attn=use_logn_attn,
+            enable_qkv_fusion=enable_qkv_fusion,
         )
 
         self.dropout1 = nn.Dropout(drop_rate)
@@ -462,6 +464,7 @@ class Qwen3MoeMoT(BaseModel):
         residual_in_fp32: bool = False,
         norm_type: str = "rmsnorm",
         qk_interleaved: bool = False,
+        enable_qkv_fusion: bool = False,
         is_reward: bool = False,
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
@@ -531,6 +534,7 @@ class Qwen3MoeMoT(BaseModel):
                     use_scaled_init=use_scaled_init,
                     use_swiglu=use_swiglu,
                     qk_interleaved=qk_interleaved,
+                    enable_qkv_fusion=enable_qkv_fusion,
                     attn_wqkv_init_std=attn_wqkv_init_std,
                     attn_other_init_std=attn_other_init_std,
                     ffn_uplayer_init_std=ffn_uplayer_init_std,
@@ -604,6 +608,7 @@ class Qwen3MoeMoT(BaseModel):
                             use_scaled_init=use_scaled_init,
                             use_swiglu=use_swiglu,
                             qk_interleaved=qk_interleaved,
+                            enable_qkv_fusion=enable_qkv_fusion,
                             attn_wqkv_init_std=attn_wqkv_init_std,
                             attn_other_init_std=attn_other_init_std,
                             ffn_uplayer_init_std=ffn_uplayer_init_std,
