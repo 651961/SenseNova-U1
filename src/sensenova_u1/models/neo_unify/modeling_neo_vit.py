@@ -121,10 +121,25 @@ class NEOVisionEmbeddings(nn.Module):
         self.llm_embed_dim = config.llm_hidden_size[0]
         self.downsample_factor = int(1 / config.downsample_ratio[0])
         self.patch_size = config.patch_size
+        self.split_alpha_embedding = bool(
+            config.num_channels == 4 and getattr(config, "split_alpha_embedding", False)
+        )
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            in_channels=3 if self.split_alpha_embedding else config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
         )
+        if self.split_alpha_embedding:
+            self.alpha_patch_embedding = nn.Conv2d(
+                in_channels=1,
+                out_channels=self.embed_dim,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+                bias=False,
+            )
+            nn.init.zeros_(self.alpha_patch_embedding.weight)
         self.dense_embedding = nn.Conv2d(
             in_channels=self.embed_dim, out_channels=self.llm_embed_dim, kernel_size=self.downsample_factor, stride=self.downsample_factor
         )
@@ -165,7 +180,12 @@ class NEOVisionEmbeddings(nn.Module):
             self.patch_size,
             self.patch_size,
         )   # [N, C * patch_size**2] -> [N, C, patch_size, patch_size]
-        patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
+        if self.split_alpha_embedding:
+            patch_values = self.patch_embedding(pixel_values[:, :3])
+            patch_values = patch_values + self.alpha_patch_embedding(pixel_values[:, 3:4])
+        else:
+            patch_values = self.patch_embedding(pixel_values)
+        patch_embeds = self.gelu(patch_values).view(-1, self.embed_dim)
         self.cos_cached_x = self.cos_cached_x.to(patch_embeds.device)
         self.sin_cached_x = self.sin_cached_x.to(patch_embeds.device)
         self.cos_cached_y = self.cos_cached_y.to(patch_embeds.device)

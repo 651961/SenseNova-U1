@@ -173,6 +173,8 @@ class NEOChatModel(PreTrainedModel):
         self.patch_size = patch_size
         self.template = config.template
         self.downsample_ratio = config.downsample_ratio
+        self.use_pixel_head = config.use_pixel_head
+        self.image_gen_channels = 4
         config.llm_config._attn_implementation = 'eager'
 
         if vision_model is not None:
@@ -180,7 +182,8 @@ class NEOChatModel(PreTrainedModel):
         else:
             self.vision_model = NEOVisionModel(config.vision_config)
         generation_vision_config = copy.deepcopy(config.vision_config)
-        generation_vision_config.num_channels = 4
+        generation_vision_config.num_channels = self.image_gen_channels
+        generation_vision_config.split_alpha_embedding = self.use_pixel_head
         vision_model_mot_gen = NEOVisionModel(generation_vision_config)
         if language_model is not None:
             self.language_model = language_model
@@ -195,10 +198,9 @@ class NEOChatModel(PreTrainedModel):
                 self.language_model = Qwen3ForCausalLM(config.llm_config)
 
         merge_size = int(1 / self.downsample_ratio)
-        output_dim = 4*(patch_size*merge_size)**2
+        output_dim = self.image_gen_channels * (patch_size * merge_size) ** 2
         llm_hidden_size = self.config.llm_config.hidden_size
         self.use_deep_fm_head = self.config.fm_head_layers > 2
-        self.use_pixel_head = self.config.use_pixel_head
         if self.use_deep_fm_head:
                 fm_head = FlowMatchingHead(llm_hidden_size, output_dim, dim=self.config.fm_head_dim, layers=self.config.fm_head_layers, mlp_ratio=self.config.fm_head_mlp_ratio)
         else:
@@ -218,7 +220,10 @@ class NEOChatModel(PreTrainedModel):
                 )
 
         if self.use_pixel_head:
-            self.fm_modules["fm_head"] = ConvDecoder(llm_hidden_size)
+            self.fm_modules["fm_head"] = ConvDecoder(
+                llm_hidden_size,
+                output_channels=self.image_gen_channels,
+            )
 
         self.concat_time_token_num = config.concat_time_token_num
         self.noise_scale = config.noise_scale

@@ -571,8 +571,13 @@ class PatchDecoder_preps1(nn.Module):
         return x
 
 class ConvDecoder(nn.Module):
-    def __init__(self, input_dim=4096, hidden_dim=1024):
+    """Decode image tokens while keeping U1.5 RGB checkpoint weights loadable."""
+
+    def __init__(self, input_dim=4096, hidden_dim=1024, output_channels=3):
         super().__init__()
+        if output_channels not in (3, 4):
+            raise ValueError(f"ConvDecoder supports 3 or 4 output channels, got {output_channels}.")
+        self.output_channels = output_channels
         # layer 1: H/32 -> H/16 (2x upscale)
         self.ps1 = nn.PixelShuffle(2)
         self.conv1 = nn.Conv2d(input_dim // 4, hidden_dim, kernel_size=3, padding=1)
@@ -581,11 +586,19 @@ class ConvDecoder(nn.Module):
         # layer 2: H/16 -> H/8 (2x upscale)
         self.ps2 = nn.PixelShuffle(2)
         self.conv2 = nn.Conv2d(hidden_dim // 4, 192, kernel_size=3, padding=1)
+        if output_channels == 4:
+            self.alpha_conv = nn.Conv2d(hidden_dim // 4, 64, kernel_size=3, padding=1)
+            nn.init.zeros_(self.alpha_conv.weight)
+            nn.init.zeros_(self.alpha_conv.bias)
 
         # layer 3: H/8 -> H (8x upscale)
         self.ps3 = nn.PixelShuffle(8)
 
     def forward(self, x):
-        x = self.act1(self.conv1(self.ps1((x))))
-        x = self.ps3(self.conv2(self.ps2((x))))
-        return x
+        x = self.act1(self.conv1(self.ps1(x)))
+        x = self.ps2(x)
+        rgb = self.ps3(self.conv2(x))
+        if self.output_channels == 3:
+            return rgb
+        alpha = self.ps3(self.alpha_conv(x))
+        return torch.cat((rgb, alpha), dim=1)

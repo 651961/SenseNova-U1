@@ -14,11 +14,80 @@ from sensenovavl.data.dataset_interleaved_iterable import (
     remap_layer_group_ids_for_packed_documents,
 )
 from sensenovavl.model.layered_mse_loss import split_layered_mse
+from sensenovavl.model.modules.fm_modules import ConvDecoder as TrainingConvDecoder
 from sensenovavl.model.sensenovavl_moe_chat.modeling_sensenovavl_chat_mot import (
     SenseNovaVLChatMoTModel,
     build_modality_indicators,
     pack_two_branch_sequence,
 )
+from sensenovavl.model.sensenovavl_moe_chat.modeling_neo_vit import (
+    InternVisionEmbeddings,
+)
+from sensenova_u1.models.neo_unify.modeling_fm_modules import (
+    ConvDecoder as InferenceConvDecoder,
+)
+from sensenova_u1.models.neo_unify.modeling_neo_vit import NEOVisionEmbeddings
+
+
+def test_rgba_pixel_head_preserves_pretrained_rgb_branch():
+    for decoder_cls in (TrainingConvDecoder, InferenceConvDecoder):
+        rgb_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=3)
+        rgba_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=4)
+        incompatible = rgba_decoder.load_state_dict(rgb_decoder.state_dict(), strict=False)
+
+        assert incompatible.missing_keys == ["alpha_conv.weight", "alpha_conv.bias"]
+        assert incompatible.unexpected_keys == []
+
+        inputs = torch.randn(2, 16, 2, 3)
+        rgb = rgb_decoder(inputs)
+        rgba = rgba_decoder(inputs)
+        assert rgba.shape == (2, 4, 64, 96)
+        torch.testing.assert_close(rgba[:, :3], rgb)
+        torch.testing.assert_close(rgba[:, 3], torch.zeros_like(rgba[:, 3]))
+
+
+def test_split_alpha_embedding_keeps_rgb_checkpoint_shape():
+    config_kwargs = dict(
+        hidden_size=8,
+        llm_hidden_size=[16],
+        downsample_ratio=[0.5],
+        image_size=4,
+        patch_size=2,
+        add_pos_embedding=False,
+        max_position_embeddings_vision=16,
+        rope_theta_vision=10000.0,
+    )
+    for embedding_cls in (InternVisionEmbeddings, NEOVisionEmbeddings):
+        rgb_embedding = embedding_cls(
+            SimpleNamespace(
+                **config_kwargs,
+                num_channels=3,
+                split_alpha_embedding=False,
+            )
+        )
+        rgba_embedding = embedding_cls(
+            SimpleNamespace(
+                **config_kwargs,
+                num_channels=4,
+                split_alpha_embedding=True,
+            )
+        )
+        incompatible = rgba_embedding.load_state_dict(
+            rgb_embedding.state_dict(),
+            strict=False,
+        )
+
+        assert incompatible.missing_keys == ["alpha_patch_embedding.weight"]
+        assert incompatible.unexpected_keys == []
+        assert rgba_embedding.patch_embedding.weight.shape[1] == 3
+        torch.testing.assert_close(
+            rgba_embedding.patch_embedding.weight,
+            rgb_embedding.patch_embedding.weight,
+        )
+        torch.testing.assert_close(
+            rgba_embedding.alpha_patch_embedding.weight,
+            torch.zeros_like(rgba_embedding.alpha_patch_embedding.weight),
+        )
 
 
 def test_split_layered_mse_ignores_base_alpha_and_splits_later_layers():
