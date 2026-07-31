@@ -94,10 +94,24 @@ def _denorm(x: torch.Tensor) -> torch.Tensor:
     return (x * std + mean).clamp(0, 1)
 
 
-def _to_pil(batch: torch.Tensor) -> list[Image.Image]:
-    arr = _denorm(batch.float()).permute(0, 2, 3, 1).cpu().numpy()
-    arr = (arr * 255.0).round().astype(np.uint8)
-    return [Image.fromarray(a, mode="RGBA") for a in arr]
+def _to_pil(batch: torch.Tensor) -> list[list[Image.Image]]:
+    """Convert [B, N, 4, H, W] normalized tensors to RGBA layer stacks."""
+    if batch.ndim != 5 or batch.shape[1] < 1 or batch.shape[2] != 4:
+        raise ValueError(
+            f"Expected generated images with shape [B, N, 4, H, W], got {tuple(batch.shape)}."
+        )
+    batch_size, num_layers, _, height, width = batch.shape
+    flat_batch = batch.reshape(batch_size * num_layers, 4, height, width)
+    arr = _denorm(flat_batch.float()).permute(0, 2, 3, 1).cpu().numpy()
+    arr = (arr * 255.0).round().astype(np.uint8).reshape(
+        batch_size, num_layers, height, width, 4
+    )
+    # Keep the serialized contract even if a future sampler violates its invariant.
+    arr[:, 0, :, :, 3] = 255
+    return [
+        [Image.fromarray(arr[sample_idx, layer_idx], mode="RGBA") for layer_idx in range(num_layers)]
+        for sample_idx in range(batch_size)
+    ]
 
 
 def _load_input_image(
@@ -111,7 +125,9 @@ def _load_input_image(
     if img.mode == "RGBA":
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[3])
-    img = img.convert("RGB")
+        img = bg
+    else:
+        img = img.convert("RGB")
     if do_resize and input_max_pixels is not None:
         img = _resize_to_max_budget(img, input_max_pixels)
     return img
@@ -214,7 +230,8 @@ class SenseNovaU1Editing:
         batch_size: int = 1,
         think_mode: bool = False,
         seed: int = 0,
-    ) -> tuple[list[Image.Image], str]:
+        num_layers: int = 1,
+    ) -> tuple[list[list[Image.Image]], str]:
         with make_offload_ctx(self.model, self.prefetch_count, self.device) as offloaded:
             output = offloaded.it2i_generate(
                 self.tokenizer,
@@ -228,6 +245,7 @@ class SenseNovaU1Editing:
                 cfg_interval=cfg_interval,
                 num_steps=num_steps,
                 batch_size=batch_size,
+                num_layers=num_layers,
                 think_mode=think_mode,
                 seed=seed,
             )
@@ -237,18 +255,46 @@ class SenseNovaU1Editing:
 
 
 def _save_images(
-    images: Sequence[Image.Image],
+    images: Sequence[Sequence[Image.Image]],
     out_path: Path,
 ) -> None:
+    if not images or any(not layers for layers in images):
+        raise ValueError("Cannot save an empty generated image batch or layer stack.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if len(images) == 1:
-        images[0].save(out_path)
+    if len(images) == 1 and len(images[0]) == 1:
+        images[0][0].save(out_path)
         print(f"[saved] {out_path}")
         return
-    for i, img in enumerate(images):
-        p = out_path.with_name(f"{out_path.stem}_{i}{out_path.suffix}")
-        img.save(p)
-        print(f"[saved] {p}")
+
+    for sample_idx, layers in enumerate(images):
+        sample_suffix = "" if len(images) == 1 else f"_sample_{sample_idx:03d}"
+        if len(layers) == 1:
+            path = out_path.with_name(
+                f"{out_path.stem}{sample_suffix}{out_path.suffix}"
+            )
+            layers[0].save(path)
+            print(f"[saved] {path}")
+            continue
+
+        for layer_idx, image in enumerate(layers):
+            path = out_path.with_name(
+                f"{out_path.stem}{sample_suffix}_layer_{layer_idx:03d}.png"
+            )
+            image.save(path)
+            print(f"[saved] {path}")
+
+
+def _composite_layers(layers: Sequence[Image.Image]) -> Image.Image:
+    if not layers:
+        raise ValueError("Cannot composite an empty layer stack.")
+    canvas = Image.new("RGBA", layers[0].size, (0, 0, 0, 0))
+    for layer_idx, layer in enumerate(layers):
+        if layer.size != canvas.size:
+            raise ValueError(
+                f"Layer {layer_idx} has size {layer.size}, expected {canvas.size}."
+            )
+        canvas = Image.alpha_composite(canvas, layer.convert("RGBA"))
+    return canvas.convert("RGB")
 
 
 def parse_args() -> argparse.Namespace:
@@ -275,7 +321,7 @@ def parse_args() -> argparse.Namespace:
         "--jsonl",
         help='JSONL file, one sample per line. Required: {"prompt": str, '
         '"image": str | list[str]}. Optional: {"width": int, "height": int, '
-        '"seed": int, "type": str}. When "width" and "height" are both '
+        '"seed": int, "num_layers": int, "type": str}. When "width" and "height" are both '
         "present they override --width / --height for that sample.",
     )
 
@@ -375,6 +421,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_steps", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument(
+        "--num_layers",
+        type=int,
+        default=1,
+        help=(
+            "Images generated per sample in bottom-to-top order. "
+            "Use 1 (default) for normal editing and >=2 for layered generation; "
+            "layer 0 is always opaque."
+        ),
+    )
+    p.add_argument(
         "--seed",
         type=int,
         default=DEFAULT_SEED,
@@ -457,6 +513,8 @@ def parse_args() -> argparse.Namespace:
             p.error(
                 f"--width / --height must each be a multiple of {_IMAGE_GRID_FACTOR} (got {args.width}x{args.height})."
             )
+    if args.num_layers < 1:
+        p.error("--num_layers must be >= 1.")
     return args
 
 
@@ -509,7 +567,7 @@ def main() -> None:
             target_pixels=args.target_pixels,
         )
         # _set_seed(args.seed)
-        with profiler.time_generate(w, h, args.batch_size):
+        with profiler.time_generate(w, h, args.batch_size * args.num_layers):
             outputs, think_text = engine.edit(
                 args.prompt,
                 images,
@@ -521,6 +579,7 @@ def main() -> None:
                 cfg_interval=cfg_interval,
                 num_steps=args.num_steps,
                 batch_size=args.batch_size,
+                num_layers=args.num_layers,
                 think_mode=args.think,
                 seed=args.seed,
             )
@@ -532,7 +591,7 @@ def main() -> None:
             think_path.write_text(think_text, encoding="utf-8")
             print(f"[saved] {think_path}")
         if args.compare:
-            save_compare(out_path, images, outputs[0], args.prompt)
+            save_compare(out_path, images, _composite_layers(outputs[0]), args.prompt)
         profiler.report()
         return
 
@@ -565,8 +624,12 @@ def main() -> None:
             explicit=_explicit_size_from_sample(sample) or cli_explicit_size,
             target_pixels=args.target_pixels,
         )
+        num_layers = int(sample.get("num_layers", args.num_layers))
+        if num_layers < 1:
+            raise SystemExit(f"JSONL sample {i + 1}: num_layers must be >= 1.")
+        seed = int(sample.get("seed", args.seed))
         # _set_seed(int(sample.get("seed", args.seed)))
-        with profiler.time_generate(w, h, 1):
+        with profiler.time_generate(w, h, num_layers):
             outputs, think_text = engine.edit(
                 sample["prompt"],
                 images,
@@ -578,18 +641,19 @@ def main() -> None:
                 cfg_interval=cfg_interval,
                 num_steps=args.num_steps,
                 batch_size=1,
+                num_layers=num_layers,
                 think_mode=args.think,
-                seed=args.seed,
+                seed=seed,
             )
         tag = sample.get("type")
         stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"
         sample_out = out_dir / stem
-        outputs[0].save(sample_out)
+        _save_images(outputs, sample_out)
         if think_text:
             think_path = sample_out.with_suffix(".think.txt")
             think_path.write_text(think_text, encoding="utf-8")
         if args.compare:
-            save_compare(sample_out, images, outputs[0], sample["prompt"])
+            save_compare(sample_out, images, _composite_layers(outputs[0]), sample["prompt"])
 
     profiler.report()
 

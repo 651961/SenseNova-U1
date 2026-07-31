@@ -387,34 +387,86 @@ class NEOChatModel(PreTrainedModel):
     
     def patchify(self, images, patch_size, channel_first=False):
         """
-        images: (N, 4, H, W)
-        x: (N, L, patch_size**2 *4)
+        images: (..., 4, H, W)
+        x: (..., L, patch_size**2 * 4)
         """
-        h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
-        x = images.reshape(shape=(images.shape[0], 4, h, patch_size, w, patch_size))
+        if images.ndim < 4 or images.shape[-3] != 4:
+            raise ValueError(
+                f"Expected RGBA images with shape (..., 4, H, W), got {tuple(images.shape)}."
+            )
+        leading_shape = images.shape[:-3]
+        h, w = images.shape[-2] // patch_size, images.shape[-1] // patch_size
+        x = images.reshape(-1, 4, h, patch_size, w, patch_size)
 
         if channel_first:
             x = torch.einsum('nchpwq->nhwcpq', x)
         else:
             x = torch.einsum('nchpwq->nhwpqc', x)
         
-        x = x.reshape(shape=(images.shape[0], h * w, patch_size**2 * 4))
+        x = x.reshape(*leading_shape, h * w, patch_size**2 * 4)
         return x
     
-    def unpatchify(sle, x, patch_size, h=None, w=None):
+    def unpatchify(self, x, patch_size, h=None, w=None):
         """
-        x: (N, L, patch_size**2 *4)
-        images: (N, 4, H, W)
+        x: (..., L, patch_size**2 * 4)
+        images: (..., 4, H, W)
         """
+        if x.ndim < 3 or x.shape[-1] % 4:
+            raise ValueError(
+                f"Expected RGBA patches with shape (..., L, patch_area * 4), got {tuple(x.shape)}."
+            )
+        leading_shape = x.shape[:-2]
         if h is None or w is None:
-            h = w = int(x.shape[1]**.5)
+            h = w = int(x.shape[-2]**.5)
         else:
             h = h // patch_size
             w = w // patch_size        
-        x = x.reshape(shape=(x.shape[0], h, w, patch_size, patch_size, 4))
+        if x.shape[-2] != h * w:
+            raise ValueError(
+                f"Patch count {x.shape[-2]} does not match the requested {h}x{w} grid."
+            )
+        if x.shape[-1] != patch_size**2 * 4:
+            raise ValueError(
+                f"Patch width {x.shape[-1]} does not match patch_size={patch_size} for RGBA."
+            )
+        x = x.reshape(-1, h, w, patch_size, patch_size, 4)
         x = torch.einsum('nhwpqc->nchpwq', x)
-        images = x.reshape(shape=(x.shape[0], 4, h * patch_size, w * patch_size))
+        images = x.reshape(*leading_shape, 4, h * patch_size, w * patch_size)
         return images
+
+    @staticmethod
+    def _validate_num_layers(num_layers):
+        if isinstance(num_layers, bool) or not isinstance(num_layers, int) or num_layers < 1:
+            raise ValueError(f"num_layers must be an integer >= 1, got {num_layers!r}.")
+
+    @staticmethod
+    def _force_first_image_opaque(images):
+        """Project the first generated image onto opaque alpha in normalized space."""
+        if images.ndim == 4 and images.shape[1] == 4:
+            images[:, 3].fill_(1)
+        elif images.ndim == 5 and images.shape[1] >= 1 and images.shape[2] == 4:
+            images[:, 0, 3].fill_(1)
+        else:
+            raise ValueError(
+                "Expected generated images with shape [B, 4, H, W] or "
+                f"[B, N, 4, H, W], got {tuple(images.shape)}."
+            )
+        return images
+
+    def _zero_first_image_alpha_velocity(self, v_pred, num_layers):
+        """Keep the opaque base image out of both sampling and CFG normalization."""
+        self._validate_num_layers(num_layers)
+        if v_pred.ndim != 3 or v_pred.shape[1] % num_layers or v_pred.shape[2] % 4:
+            raise ValueError(
+                f"Invalid layered velocity shape {tuple(v_pred.shape)} for num_layers={num_layers}."
+            )
+        batch_size, image_token_num, patch_width = v_pred.shape
+        per_layer_tokens = image_token_num // num_layers
+        rgba_velocity = v_pred.reshape(
+            batch_size, num_layers, per_layer_tokens, patch_width // 4, 4
+        )
+        rgba_velocity[:, 0, :, :, 3].zero_()
+        return rgba_velocity.reshape_as(v_pred)
     
     def _euler_step(self, v_pred, z, t, t_next):
         z_next = z + (t_next - t) * v_pred
@@ -471,9 +523,14 @@ class NEOChatModel(PreTrainedModel):
         attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
         return input_ids, indexes, attention_mask
     
-    def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
-        t_image = torch.full((token_h * token_w,), text_len, dtype=torch.long, device=device)
-        idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+    def _build_t2i_image_indexes(self, token_h, token_w, text_len, device, num_layers=1):
+        self._validate_num_layers(num_layers)
+        tokens_per_layer = token_h * token_w
+        layer_idx = torch.arange(num_layers, device=device, dtype=torch.long).repeat_interleave(
+            tokens_per_layer
+        )
+        t_image = text_len + layer_idx
+        idx = torch.arange(tokens_per_layer, device=device, dtype=torch.long).repeat(num_layers)
         h_image = idx // token_w
         w_image = idx % token_w
         return torch.stack([t_image, h_image, w_image], dim=0)
@@ -581,8 +638,14 @@ class NEOChatModel(PreTrainedModel):
 
         return past_key_values, t_idx, think_text
     
-    def _t2i_predict_v(self, input_embeds, indexes_image, attn_mask, past_key_values, t, z, image_token_num, timestep_embeddings=None, image_size=None):
+    def _t2i_predict_v(self, input_embeds, indexes_image, attn_mask, past_key_values, t, z, image_token_num, timestep_embeddings=None, image_size=None, num_layers=1):
+        self._validate_num_layers(num_layers)
         B, L = z.shape[0], z.shape[1]
+        if L != image_token_num or image_token_num % num_layers:
+            raise ValueError(
+                f"Expected {image_token_num} image tokens split across {num_layers} layer(s), "
+                f"but the latent has shape {tuple(z.shape)}."
+            )
 
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
@@ -598,17 +661,23 @@ class NEOChatModel(PreTrainedModel):
             merge_size = int(1 / self.downsample_ratio)
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
+            tokens_per_layer = token_h * token_w
+            if image_token_num != num_layers * tokens_per_layer:
+                raise ValueError(
+                    f"image_token_num={image_token_num} does not match num_layers={num_layers} "
+                    f"and the {token_h}x{token_w} image-token grid."
+                )
 
-            img_reshaped = outputs.last_hidden_state[:, -image_token_num:].view(B, token_h, token_w, -1)
+            img_reshaped = outputs.last_hidden_state[:, -image_token_num:].view(
+                B * num_layers, token_h, token_w, -1
+            )
             img_2d = torch.einsum("b h w c -> b c h w", img_reshaped)
-            img_2d = img_2d.contiguous().view(B, -1, token_h, token_w)
+            img_2d = img_2d.contiguous().view(B * num_layers, -1, token_h, token_w)
                 
             smoothed_img_2d = self.fm_modules['fm_head'](img_2d)
-                
-            smoothed_reshaped = smoothed_img_2d.view(B, 4, token_h, self.patch_size * merge_size, token_w, self.patch_size * merge_size)
-            smoothed_reshaped = torch.einsum("b c h p w q -> b h w p q c", smoothed_reshaped)
-            out_1d = smoothed_reshaped.contiguous().view(B, L, self.patch_size * merge_size * self.patch_size * merge_size * 4)
-            x_pred = out_1d
+            x_pred = self.patchify(
+                smoothed_img_2d, self.patch_size * merge_size
+            ).view(B, L, -1)
         else:
             if self.use_deep_fm_head:
                 x_pred = self.fm_modules["fm_head"](
@@ -621,7 +690,7 @@ class NEOChatModel(PreTrainedModel):
             
         
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
-        return v_pred
+        return self._zero_first_image_alpha_velocity(v_pred, num_layers)
     
     def _build_it2i_inputs(self, tokenizer, query, pixel_values=None, grid_hw=None):
         model_inputs = tokenizer(query, return_tensors="pt")
@@ -843,6 +912,7 @@ class NEOChatModel(PreTrainedModel):
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
                 image_prediction = noise_scale * torch.randn((1, 4, cur_image_size[1], cur_image_size[0]), device=device, dtype=outputs_cond.logits.dtype)
+                self._force_first_image_opaque(image_prediction)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -936,6 +1006,7 @@ class NEOChatModel(PreTrainedModel):
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, cur_image_size[1], cur_image_size[0])
+                    self._force_first_image_opaque(image_prediction)
 
                 generated_images.append(image_prediction)
 
@@ -1191,6 +1262,7 @@ class NEOChatModel(PreTrainedModel):
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
                 image_prediction = noise_scale * torch.randn((1, 4, image_size[1], image_size[0]), device=device, dtype=outputs_cond.logits.dtype, generator=generator)
+                self._force_first_image_opaque(image_prediction)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -1281,6 +1353,7 @@ class NEOChatModel(PreTrainedModel):
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+                    self._force_first_image_opaque(image_prediction)
 
                 generated_images.append(image_prediction)
 
@@ -1351,8 +1424,9 @@ class NEOChatModel(PreTrainedModel):
         return generated_text, generated_images
 
     @torch.no_grad()
-    def it2i_generate(self, tokenizer, prompt, images, cfg_scale=1, img_cfg_scale=1, cfg_norm='none', enable_timestep_shift=True, timestep_shift=1, image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
+    def it2i_generate(self, tokenizer, prompt, images, cfg_scale=1, img_cfg_scale=1, cfg_norm='none', enable_timestep_shift=True, timestep_shift=1, image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0, num_layers=1):
         assert cfg_norm in ['none', 'global', 'channel']
+        self._validate_num_layers(num_layers)
 
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.config.t_eps = t_eps
@@ -1424,20 +1498,33 @@ class NEOChatModel(PreTrainedModel):
 
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
+        image_token_num = num_layers * token_h * token_w
 
         indexes_image_condition = self._build_t2i_image_indexes(
-            token_h, token_w, indexes_condition[0].max() + 1, device=input_embeds_condition.device
+            token_h,
+            token_w,
+            indexes_condition[0].max() + 1,
+            device=input_embeds_condition.device,
+            num_layers=num_layers,
         )
         indexes_image_img_condition = (
             self._build_t2i_image_indexes(
-                token_h, token_w, indexes_img_condition[0].max() + 1, device=input_embeds_img_condition.device
+                token_h,
+                token_w,
+                indexes_img_condition[0].max() + 1,
+                device=input_embeds_img_condition.device,
+                num_layers=num_layers,
             )
             if indexes_img_condition is not None
             else None
         )
         indexes_image_uncondition = (
             self._build_t2i_image_indexes(
-                token_h, token_w, indexes_uncondition[0].max() + 1, device=input_embeds_uncondition.device
+                token_h,
+                token_w,
+                indexes_uncondition[0].max() + 1,
+                device=input_embeds_uncondition.device,
+                num_layers=num_layers,
             )
             if indexes_uncondition is not None
             else None
@@ -1462,7 +1549,11 @@ class NEOChatModel(PreTrainedModel):
                 IMG_START_TOKEN,
             )
             indexes_image_condition = self._build_t2i_image_indexes(
-                token_h, token_w, t_index_condition + 1, device=input_embeds_condition.device
+                token_h,
+                token_w,
+                t_index_condition + 1,
+                device=input_embeds_condition.device,
+                num_layers=num_layers,
             )
         else:
             past_key_values_condition, hidden_states_condition = self._it2i_prefix_forward(
@@ -1514,25 +1605,27 @@ class NEOChatModel(PreTrainedModel):
 
         prepare_flash_kv_cache(
             past_key_values_condition,
-            current_len=token_h * token_w,
+            current_len=image_token_num,
             batch_size=batch_size,
         )
         if past_key_values_img_condition is not None:
             prepare_flash_kv_cache(
                 past_key_values_img_condition,
-                current_len=token_h * token_w,
+                current_len=image_token_num,
                 batch_size=batch_size,
             )
         if past_key_values_uncondition is not None:
             prepare_flash_kv_cache(
                 past_key_values_uncondition,
-                current_len=token_h * token_w,
+                current_len=image_token_num,
                 batch_size=batch_size,
             )
 
         grid_h = image_size[1] // self.patch_size
         grid_w = image_size[0] // self.patch_size
-        grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=device)
+        grid_hw = torch.tensor(
+            [[grid_h, grid_w]] * (batch_size * num_layers), device=device
+        )
 
         noise_scale = self.noise_scale
         if self.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
@@ -1544,8 +1637,12 @@ class NEOChatModel(PreTrainedModel):
         noise_scale = min(noise_scale, self.noise_scale_max_value)
         generator = torch.Generator(device).manual_seed(seed)
         image_prediction = noise_scale * torch.randn(
-            (batch_size, 4, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator
+            (batch_size, num_layers, 4, image_size[1], image_size[0]),
+            device=device,
+            dtype=dtype,
+            generator=generator,
         )
+        self._force_first_image_opaque(image_prediction)
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_img_condition = {"full_attention": None}
@@ -1560,18 +1657,20 @@ class NEOChatModel(PreTrainedModel):
             t_next = timesteps[step_i + 1]
             use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[0] == 0
 
-            z = self.patchify(image_prediction, self.patch_size * merge_size)
+            z = self.patchify(
+                image_prediction, self.patch_size * merge_size
+            ).flatten(1, 2)
             image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
             image_embeds = self.extract_feature(
-                image_input.view(batch_size * grid_h * grid_w, -1),
+                image_input.reshape(batch_size * num_layers * grid_h * grid_w, -1),
                 gen_model=True,
                 grid_hw=grid_hw,
-            ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h * token_w, -1)
+            ).view(batch_size, image_token_num, -1)
+            t_expanded = t.expand(batch_size * image_token_num)
+            timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, image_token_num, -1)
             if self.add_noise_scale_embedding:
                 noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
-                noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, token_h * token_w, -1)
+                noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, image_token_num, -1)
                 timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
 
@@ -1582,9 +1681,10 @@ class NEOChatModel(PreTrainedModel):
                 past_key_values_condition,
                 t,
                 z,
-                image_token_num=token_h * token_w,
+                image_token_num=image_token_num,
                 timestep_embeddings=timestep_embeddings,
                 image_size=image_size,
+                num_layers=num_layers,
             )
 
             if not use_cfg:
@@ -1599,9 +1699,10 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_img_condition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_token_num,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
+                    num_layers=num_layers,
                 )
                 v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
             elif cfg_scale == img_cfg_scale:
@@ -1612,9 +1713,10 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_uncondition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_token_num,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
+                    num_layers=num_layers,
                 )
                 v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
@@ -1625,9 +1727,10 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_img_condition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_token_num,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
+                    num_layers=num_layers,
                 )
                 out_uncond = self._t2i_predict_v(
                     image_embeds,
@@ -1636,9 +1739,10 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_uncondition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_token_num,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
+                    num_layers=num_layers,
                 )
                 v_pred = (
                     out_uncond
@@ -1658,7 +1762,13 @@ class NEOChatModel(PreTrainedModel):
                     v_pred = v_pred * scale
 
             z = z + (t_next - t) * v_pred
-            image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+            image_prediction = self.unpatchify(
+                z.reshape(batch_size, num_layers, token_h * token_w, -1),
+                self.patch_size * merge_size,
+                image_size[1],
+                image_size[0],
+            )
+            self._force_first_image_opaque(image_prediction)
 
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_img_condition is not None:
@@ -1672,9 +1782,10 @@ class NEOChatModel(PreTrainedModel):
         return image_prediction
 
     @torch.no_grad()
-    def t2i_generate(self, tokenizer, prompt, cfg_scale=1, timestep_shift=1, enable_timestep_shift=True, cfg_norm='none', image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
+    def t2i_generate(self, tokenizer, prompt, cfg_scale=1, timestep_shift=1, enable_timestep_shift=True, cfg_norm='none', image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0, num_layers=1):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ['cfg_zero_star', 'global', 'none', 'channel']
+        self._validate_num_layers(num_layers)
         merge_size = int(1 / self.downsample_ratio)
 
         self.config.t_eps = t_eps
@@ -1697,10 +1808,23 @@ class NEOChatModel(PreTrainedModel):
        
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
+        image_token_num = num_layers * token_h * token_w
 
-        indexes_image_condition = self._build_t2i_image_indexes(token_h, token_w, indexes_condition.shape[1], device=input_ids_condition.device)
+        indexes_image_condition = self._build_t2i_image_indexes(
+            token_h,
+            token_w,
+            indexes_condition.shape[1],
+            device=input_ids_condition.device,
+            num_layers=num_layers,
+        )
         indexes_image_uncondition = (
-            self._build_t2i_image_indexes(token_h, token_w, indexes_uncondition.shape[1], device=input_ids_uncondition.device)
+            self._build_t2i_image_indexes(
+                token_h,
+                token_w,
+                indexes_uncondition.shape[1],
+                device=input_ids_uncondition.device,
+                num_layers=num_layers,
+            )
             if indexes_uncondition is not None
             else None
         )
@@ -1724,7 +1848,11 @@ class NEOChatModel(PreTrainedModel):
                 IMG_START_TOKEN,
             )
             indexes_image_condition = self._build_t2i_image_indexes(
-                token_h, token_w, t_index_condition + 1, device=input_ids_condition.device
+                token_h,
+                token_w,
+                t_index_condition + 1,
+                device=input_ids_condition.device,
+                num_layers=num_layers,
             )
         else:
             past_key_values_condition, hidden_states_condition = self._t2i_prefix_forward(input_ids_condition, indexes_condition, attention_mask_condition_prefix)
@@ -1750,20 +1878,22 @@ class NEOChatModel(PreTrainedModel):
         # prepare flash cache once
         prepare_flash_kv_cache(
             past_key_values_condition,
-            current_len=token_h * token_w,
+            current_len=image_token_num,
             batch_size=batch_size,
         )
         if past_key_values_uncondition is not None:
             prepare_flash_kv_cache(
                 past_key_values_uncondition,
-                current_len=token_h * token_w,
+                current_len=image_token_num,
                 batch_size=batch_size,
             )
 
         # init noise image tokens
         grid_h = image_size[1] // self.patch_size
         grid_w = image_size[0] // self.patch_size
-        grid_hw = torch.tensor([[grid_h, grid_w]]*batch_size, device=device)
+        grid_hw = torch.tensor(
+            [[grid_h, grid_w]] * (batch_size * num_layers), device=device
+        )
 
         noise_scale = self.noise_scale
         if self.noise_scale_mode in ("resolution", "dynamic", 'dynamic_sqrt'):
@@ -1774,7 +1904,13 @@ class NEOChatModel(PreTrainedModel):
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
         generator = torch.Generator(device).manual_seed(seed)
-        image_prediction = noise_scale * torch.randn((batch_size, 4, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator)
+        image_prediction = noise_scale * torch.randn(
+            (batch_size, num_layers, 4, image_size[1], image_size[0]),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        self._force_first_image_opaque(image_prediction)
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_uncondition = {"full_attention": None}
@@ -1787,21 +1923,49 @@ class NEOChatModel(PreTrainedModel):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
 
-            z = self.patchify(image_prediction, self.patch_size * merge_size)
+            z = self.patchify(
+                image_prediction, self.patch_size * merge_size
+            ).flatten(1, 2)
             image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
-            image_embeds = self.extract_feature(image_input.view(batch_size * grid_h*grid_w, -1), gen_model=True, grid_hw=grid_hw).view(batch_size, token_h*token_w, -1)
-            t_expanded = t.expand(batch_size*token_h*token_w)
-            timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h*token_w, -1)
+            image_embeds = self.extract_feature(
+                image_input.reshape(batch_size * num_layers * grid_h * grid_w, -1),
+                gen_model=True,
+                grid_hw=grid_hw,
+            ).view(batch_size, image_token_num, -1)
+            t_expanded = t.expand(batch_size * image_token_num)
+            timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, image_token_num, -1)
             if self.add_noise_scale_embedding:
                 noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
-                noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, token_h*token_w, -1)
+                noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, image_token_num, -1)
                 timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred_condition = self._t2i_predict_v(image_embeds, indexes_image_condition, attention_mask_condition, past_key_values_condition, t, z, image_token_num=token_h*token_w, timestep_embeddings=timestep_embeddings, image_size=image_size)
+            v_pred_condition = self._t2i_predict_v(
+                image_embeds,
+                indexes_image_condition,
+                attention_mask_condition,
+                past_key_values_condition,
+                t,
+                z,
+                image_token_num=image_token_num,
+                timestep_embeddings=timestep_embeddings,
+                image_size=image_size,
+                num_layers=num_layers,
+            )
             
             if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
-                v_pred_uncondition = self._t2i_predict_v(image_embeds, indexes_image_uncondition, attention_mask_uncondition, past_key_values_uncondition, t, z, image_token_num=token_h*token_w, timestep_embeddings=timestep_embeddings, image_size=image_size)
+                v_pred_uncondition = self._t2i_predict_v(
+                    image_embeds,
+                    indexes_image_uncondition,
+                    attention_mask_uncondition,
+                    past_key_values_uncondition,
+                    t,
+                    z,
+                    image_token_num=image_token_num,
+                    timestep_embeddings=timestep_embeddings,
+                    image_size=image_size,
+                    num_layers=num_layers,
+                )
                 if cfg_norm == 'cfg_zero_star':
                     positive_flat = v_pred_condition.view(batch_size, -1)  
                     negative_flat = v_pred_uncondition.view(batch_size, -1)  
@@ -1831,7 +1995,13 @@ class NEOChatModel(PreTrainedModel):
 
             z = z + (t_next - t) * v_pred
 
-            image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+            image_prediction = self.unpatchify(
+                z.reshape(batch_size, num_layers, token_h * token_w, -1),
+                self.patch_size * merge_size,
+                image_size[1],
+                image_size[0],
+            )
+            self._force_first_image_opaque(image_prediction)
 
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_uncondition is not None:
