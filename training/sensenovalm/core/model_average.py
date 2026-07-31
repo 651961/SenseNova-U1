@@ -35,6 +35,64 @@ def _iter_named_params_and_buffers(model: Module, use_buffers: bool) -> Iterable
             yield n, b
 
 
+def _replay_state_dict_post_hooks(
+    module: Module,
+    state_dict: Dict[str, Tensor],
+    prefix: str = "",
+) -> Dict[str, Tensor]:
+    """Apply registered state-dict post-hooks to an existing state dict.
+
+    EMA shadows use the model's runtime parameter names, while checkpoint
+    compatibility hooks may export different names (for example, fused
+    ``w1_w3`` becomes separate ``w1`` and ``w3`` tensors). Replaying the same
+    hooks after inserting EMA tensors preserves the model's checkpoint schema
+    without swapping or cloning the live model parameters.
+    """
+    for name, child in module._modules.items():
+        if child is not None:
+            state_dict = _replay_state_dict_post_hooks(child, state_dict, f"{prefix}{name}.")
+
+    metadata = getattr(state_dict, "_metadata", {})
+    local_metadata = metadata.get(prefix[:-1], {"version": module._version})
+    for hook in module._state_dict_hooks.values():
+        hook_result = hook(module, state_dict, prefix, local_metadata)
+        if getattr(hook, "_from_public_api", False):
+            if hook_result is not None:
+                raise RuntimeError("state_dict post-hook must return None")
+        elif hook_result is not None:
+            state_dict = hook_result
+    return state_dict
+
+
+def _replay_load_state_dict_pre_hooks(
+    module: Module,
+    state_dict: Dict[str, Tensor],
+    prefix: str = "",
+) -> None:
+    """Convert checkpoint keys back to runtime names without loading a model."""
+    metadata = getattr(state_dict, "_metadata", {})
+    local_metadata = metadata.get(prefix[:-1], {})
+    missing_keys: List[str] = []
+    unexpected_keys: List[str] = []
+    error_msgs: List[str] = []
+    for hook in module._load_state_dict_pre_hooks.values():
+        hook(
+            state_dict,
+            prefix,
+            local_metadata,
+            True,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+    if error_msgs:
+        raise RuntimeError("Errors replaying load-state-dict hooks:\n" + "\n".join(error_msgs))
+
+    for name, child in module._modules.items():
+        if child is not None:
+            _replay_load_state_dict_pre_hooks(child, state_dict, f"{prefix}{name}.")
+
+
 class AveragedModel(Module):
     r"""Implements averaged model for Stochastic Weight Averaging (SWA) and Exponential Moving Average (EMA).
 
@@ -218,32 +276,55 @@ class AveragedModel(Module):
     @torch.no_grad()
     def get_averaged_model_state_dict(self, model: Module) -> Dict[str, Tensor]:
         """
-        Build a deepcopy-free state_dict for saving:
-        - Start from model.state_dict() (so keys are complete)
-        - Override tracked params/buffers with averaged tensors
+        Build a deepcopy-free, checkpoint-compatible state_dict for saving.
+
+        The EMA shadows are inserted under runtime parameter names first, then
+        the model's state-dict hooks are replayed so fused runtime parameters
+        are exported under the same keys as a normal model checkpoint.
         """
         sd: Dict[str, Tensor] = model.state_dict()
+        checkpoint_keys = set(sd)
         avg_tensors = [getattr(self, f"avg_{i}") for i in range(len(self._names))]
+        params = dict(model.named_parameters(recurse=True))
+        bufs = dict(model.named_buffers(recurse=True)) if self.use_buffers else {}
         for name, a in zip(self._names, avg_tensors):
-            if name not in sd:
-                # model structure changed; keep strict to avoid silently writing wrong ckpt
-                raise KeyError(f"Tracked tensor '{name}' not found in model.state_dict()")
-            ref = sd[name]
+            ref = params.get(name, bufs.get(name))
+            if ref is None:
+                raise KeyError(f"Tracked tensor '{name}' not found in model")
             sd[name] = a.detach().to(ref.device, dtype=ref.dtype).view_as(ref)
+
+        sd = _replay_state_dict_post_hooks(model, sd)
+        missing_keys = checkpoint_keys - set(sd)
+        unexpected_keys = set(sd) - checkpoint_keys
+        if missing_keys or unexpected_keys:
+            raise KeyError(
+                "EMA state-dict hook conversion changed the checkpoint schema: "
+                f"missing={sorted(missing_keys)}, unexpected={sorted(unexpected_keys)}"
+            )
         return sd
 
     @torch.no_grad()
-    def load_from_model_state_dict(self, model_state_dict: Dict[str, Tensor]) -> None:
+    def load_from_model_state_dict(
+        self,
+        model_state_dict: Dict[str, Tensor],
+        model: Optional[Module] = None,
+    ) -> None:
         """
         Initialize EMA/SWA shadow averaged model weights from a model-like state_dict
         (e.g. loaded from `<ckpt>/averaged_model/`).
         This avoids touching `model` and keeps ProcessGroup out of deepcopy.
         """
+        converted_state_dict = model_state_dict.copy()
+        if hasattr(model_state_dict, "_metadata"):
+            converted_state_dict._metadata = model_state_dict._metadata
+        if model is not None:
+            _replay_load_state_dict_pre_hooks(model, converted_state_dict)
+
         avg_tensors = [getattr(self, f"avg_{i}") for i in range(len(self._names))]
         for name, a in zip(self._names, avg_tensors):
-            if name not in model_state_dict:
+            if name not in converted_state_dict:
                 raise KeyError(f"averaged_model state dict missing key '{name}'")
-            v = model_state_dict[name]
+            v = converted_state_dict[name]
             a.copy_(v.detach().to(device=a.device, dtype=a.dtype).view_as(a))
         # Mark as initialized so subsequent update_parameters uses averaging path, not copy.
 
@@ -269,7 +350,7 @@ class AveragedModel(Module):
         with open(info_path, "r") as f:
             info = json.load(f)
         self.n_averaged.fill_(info["n_averaged"])
-        self.load_from_model_state_dict(sd)
+        self.load_from_model_state_dict(sd, model=model)
 
     def save_to_averaged_model_info(self, folder: str):
         os.makedirs(folder, exist_ok=True)
