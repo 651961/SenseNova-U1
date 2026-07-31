@@ -23,7 +23,7 @@ from sensenovalm.accelerator import AcceleratorType, get_accelerator
 from sensenovalm.core.context import global_context as gpc
 
 try:
-    from rotary_emb import apply_rotary as _flash_apply_rotary_func
+    from flash_attn.layers.rotary import apply_rotary_emb as _flash_apply_rotary_emb_func
 
     flash_rotary_impl = True
 except (ModuleNotFoundError, ImportError):
@@ -196,10 +196,7 @@ def _select_apply_rotary_func(
     conj: bool = False,
     use_fused_rope: bool = True,
 ) -> None:
-    if use_fused_rope and flash_rotary_impl:
-        _flash_apply_rotary_func(x1, x2, cos, sin, out1, out2, conj)
-    else:
-        _rope_to_float32_wrapper((0, 1, 2, 3), _torch_apply_rotary_func, x1, x2, cos, sin, out1, out2, conj)
+    _rope_to_float32_wrapper((0, 1, 2, 3), _torch_apply_rotary_func, x1, x2, cos, sin, out1, out2, conj)
 
 
 # adpated from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/layers/rotary.py#L35
@@ -307,5 +304,7 @@ def apply_rotary_emb(
         return DeeplinkApplyRotaryEmb.apply(x, cos, sin, interleaved, in_place)
     if sensenovalm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
         return ApplyRotaryEmb.apply(x, cos, sin, interleaved, in_place)
+    if flash_rotary_impl and x.is_cuda:
+        return _flash_apply_rotary_emb_func(x, cos, sin, interleaved=interleaved, inplace=in_place)
     else:
         return ApplyRotaryEmb.apply(x, cos, sin, interleaved, in_place)     # NOTE:
