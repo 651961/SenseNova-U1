@@ -95,7 +95,7 @@ class InternVisionEmbeddings(nn.Module):
         self.patch_size = config.patch_size
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            in_channels=config.num_channels, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
         )
         self.dense_embedding = nn.Conv2d(
             in_channels=self.embed_dim, out_channels=self.llm_embed_dim, kernel_size=self.downsample_factor, stride=self.downsample_factor
@@ -143,7 +143,9 @@ class InternVisionEmbeddings(nn.Module):
     def forward(self, pixel_values: torch.FloatTensor, grid_hw=None) -> torch.Tensor:
         assert pixel_values.dim() == 2, f"pixel_values must be 2D for native resolution, got: {pixel_values.dim()}"
 
-        pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)  # [N_total, 768] -> [N_total, 3, 16, 16]
+        pixel_values = pixel_values.view(
+            -1, self.config.num_channels, self.patch_size, self.patch_size
+        )
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
         current_device = get_current_device()
         if self.add_pos_embedding:

@@ -473,6 +473,8 @@ hybrid_zero_optimizer = dict(
 loss = dict(
     label_smoothing=0,
     image_gen_loss_coef=1.0,
+    rgb_weight=float(os.environ.get('rgb_weight', 1.0)),
+    alpha_weight=float(os.environ.get('alpha_weight', 1.0)),
     mtp_loss_coeff=0.1,
 )
 

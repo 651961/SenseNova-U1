@@ -99,7 +99,7 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
     # Again, we will use the first element to figure out which key/values are not None for this model.
     for k, v in first.items():
         if (
-            k not in ("label", "label_ids", "pixel_values", "image_seq_lens", "image_flags", "image_con_flags", "image_for_gen_flags", "image_for_gen_loss_flags", "is_image_duplicated_for_und_flags")
+            k not in ("label", "label_ids", "pixel_values", "image_seq_lens", "image_flags", "image_con_flags", "image_for_gen_flags", "image_for_gen_loss_flags", "is_image_duplicated_for_und_flags", "layer_group_ids", "layer_indices")
             and v is not None
             and not isinstance(v, str)
         ):
@@ -116,7 +116,7 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
         #         batch[k] = torch.concat([f[k] for f in features])
         #     elif isinstance(v, np.ndarray):
         #         batch[k] = torch.concat(np.stack([f[k] for f in features]))
-        if k in ('pixel_values', 'image_seq_lens', 'image_flags', 'image_con_flags', 'image_for_gen_flags', 'image_for_gen_loss_flags', 'is_image_duplicated_for_und_flags'):
+        if k in ('pixel_values', 'image_seq_lens', 'image_flags', 'image_con_flags', 'image_for_gen_flags', 'image_for_gen_loss_flags', 'is_image_duplicated_for_und_flags', 'layer_group_ids', 'layer_indices'):
             items = [f[k] for f in features]
             valid_items = [item for item in items if item is not None]
             if len(valid_items) == 0:

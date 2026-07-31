@@ -334,12 +334,36 @@ class LazySupervisedDataset(Dataset):
         # don't need o.5 offset
         return int(w * float(scale[0])), int(h * float(scale[1]))
 
+    @staticmethod
+    def _count_trailing_image_tokens(value):
+        count = 0
+        token = "<image>"
+        while value.endswith(token):
+            count += 1
+            value = value[: -len(token)]
+        return count
+
+    @staticmethod
+    def _num_data_item_images(data_item):
+        image_paths = data_item.get("image", data_item.get("images", []))
+        return len(image_paths) if isinstance(image_paths, list) else 1
+
     def check_t2i_data(self, data_item):
         if len(data_item["conversations"]) != 2:
             return False
         if (
-            not data_item["conversations"][1]["value"].endswith("<image>")
-            or data_item["conversations"][1]["value"].count(("<image>")) != 1
+            data_item["conversations"][0]["from"] != "human"
+            or data_item["conversations"][1]["from"] != "gpt"
+        ):
+            return False
+        num_output_layers = self._count_trailing_image_tokens(
+            data_item["conversations"][1]["value"]
+        )
+        if (
+            num_output_layers == 0
+            or data_item["conversations"][1]["value"].count("<image>")
+            != num_output_layers
+            or self._num_data_item_images(data_item) != num_output_layers
         ):
             return False
         if any(
@@ -363,12 +387,23 @@ class LazySupervisedDataset(Dataset):
         if len(data_item["conversations"]) != 2:
             return False
         if (
-            not data_item["conversations"][1]["value"].endswith("<image>")
-            or data_item["conversations"][1]["value"].count(("<image>")) != 1
+            data_item["conversations"][0]["from"] != "human"
+            or data_item["conversations"][1]["from"] != "gpt"
+        ):
+            return False
+        num_output_layers = self._count_trailing_image_tokens(
+            data_item["conversations"][1]["value"]
+        )
+        num_images = self._num_data_item_images(data_item)
+        if (
+            num_output_layers == 0
+            or data_item["conversations"][1]["value"].count("<image>")
+            != num_output_layers
+            or num_output_layers >= num_images
         ):
             return False
         if data_item["conversations"][0]["value"].count("<image>") != (
-            len(data_item["image"]) - 1
+            num_images - num_output_layers
         ):
             return False
         if any(
@@ -425,6 +460,8 @@ class LazySupervisedDataset(Dataset):
         image_for_gen_flags = []
         image_for_gen_loss_flags = []
         is_image_duplicated_for_und_flags = []
+        layer_group_ids = []
+        layer_indices = []
         interleave_not_repeat_last_flag = False
         is_cfg_drop_txt = False
 
@@ -438,21 +475,28 @@ class LazySupervisedDataset(Dataset):
             valid_data = self.check_t2i_data(data_item)
             if not valid_data:
                 assert False, f"invalid data, {data_item}"
+            num_output_layers = self._count_trailing_image_tokens(
+                data_item["conversations"][1]["value"]
+            )
 
             drop_prob = float(self.cfg_txt_uncond_drop_prob)
             if random.random() < drop_prob:
                 data_item["conversations"][human_round_i]["value"] = ""
                 # remove possible thinking process prior to the generated image
-                data_item["conversations"][-1]["value"] = "<image>"
+                data_item["conversations"][-1]["value"] = (
+                    "<image>" * num_output_layers
+                )
                 is_cfg_drop_txt = True
             else:
                 data_item["conversations"].insert(
                     0, {"from": "system", "value": T2I_EDITING_SYSTEM_MESSAGE}
                 )
 
-            image_for_gen_flags = [1]
-            image_for_gen_loss_flags = [1]
-            is_image_duplicated_for_und_flags = [0]
+            image_for_gen_flags = [1] * num_output_layers
+            image_for_gen_loss_flags = [1] * num_output_layers
+            is_image_duplicated_for_und_flags = [0] * num_output_layers
+            layer_group_ids = [0] * num_output_layers
+            layer_indices = list(range(num_output_layers))
 
             # disable this
             # if self.enabel_und_loss:
@@ -468,15 +512,21 @@ class LazySupervisedDataset(Dataset):
             valid_data = self.check_it2i_data(data_item)
             if not valid_data:
                 assert False, f"invalid data, {data_item}"
+            num_output_layers = self._count_trailing_image_tokens(
+                data_item["conversations"][1]["value"]
+            )
+            num_condition_images = len(image_path_list) - num_output_layers
 
             if self.cfg_is_uncond_drop_independent:
                 text_drop_prob = float(self.cfg_txt_uncond_drop_prob)
                 if random.random() < text_drop_prob:
                     data_item["conversations"][human_round_i]["value"] = "<image>" * (
-                        len(image_path_list) - 1
+                        num_condition_images
                     )
                     # remove possible thinking process prior to the generated image
-                    data_item["conversations"][-1]["value"] = "<image>"
+                    data_item["conversations"][-1]["value"] = (
+                        "<image>" * num_output_layers
+                    )
                     is_cfg_drop_txt = True
 
                 img_drop_prob = float(self.cfg_img_uncond_drop_prob)
@@ -486,7 +536,7 @@ class LazySupervisedDataset(Dataset):
                         .replace("<image>\n", "")
                         .replace("<image>", "")
                     )
-                    image_path_list = image_path_list[-1:]
+                    image_path_list = image_path_list[num_condition_images:]
                 elif not is_cfg_drop_txt:
                     data_item["conversations"].insert(
                         0, {"from": "system", "value": T2I_EDITING_SYSTEM_MESSAGE}
@@ -512,10 +562,12 @@ class LazySupervisedDataset(Dataset):
 
                     if drop_case == "txt":
                         data_item["conversations"][human_round_i]["value"] = (
-                            "<image>" * (len(image_path_list) - 1)
+                            "<image>" * num_condition_images
                         )
                         # remove possible thinking process prior to the generated image
-                        data_item["conversations"][-1]["value"] = "<image>"
+                        data_item["conversations"][-1]["value"] = (
+                            "<image>" * num_output_layers
+                        )
                         is_cfg_drop_txt = True
                     elif drop_case == "img":
                         data_item["conversations"][human_round_i]["value"] = (
@@ -523,21 +575,30 @@ class LazySupervisedDataset(Dataset):
                             .replace("<image>\n", "")
                             .replace("<image>", "")
                         )
-                        image_path_list = image_path_list[-1:]
+                        image_path_list = image_path_list[num_condition_images:]
                     else:
                         data_item["conversations"][human_round_i]["value"] = ""
-                        image_path_list = image_path_list[-1:]
+                        image_path_list = image_path_list[num_condition_images:]
                         # remove possible thinking process prior to the generated image
-                        data_item["conversations"][-1]["value"] = "<image>"
+                        data_item["conversations"][-1]["value"] = (
+                            "<image>" * num_output_layers
+                        )
                         is_cfg_drop_txt = True
                 else:
                     data_item["conversations"].insert(
                         0, {"from": "system", "value": T2I_EDITING_SYSTEM_MESSAGE}
                     )
 
-            image_for_gen_flags = [0] * (len(image_path_list) - 1) + [1]
-            image_for_gen_loss_flags = [0] * (len(image_path_list) - 1) + [1]
+            num_condition_images = len(image_path_list) - num_output_layers
+            image_for_gen_flags = [0] * num_condition_images + [1] * num_output_layers
+            image_for_gen_loss_flags = (
+                [0] * num_condition_images + [1] * num_output_layers
+            )
             is_image_duplicated_for_und_flags.extend([0] * len(image_path_list))
+            layer_group_ids = [-1] * num_condition_images + [0] * num_output_layers
+            layer_indices = [-1] * num_condition_images + list(
+                range(num_output_layers)
+            )
 
             # disable this
             # if self.enabel_und_loss:
@@ -598,6 +659,7 @@ class LazySupervisedDataset(Dataset):
 
             image_path_list_new = []
             image_i = 0
+            next_layer_group_id = 0
             for turn_i, conv in enumerate(data_item["conversations"]):
                 # non gpt round
                 if conv["from"] != "gpt":
@@ -610,6 +672,8 @@ class LazySupervisedDataset(Dataset):
                         image_for_gen_flags.extend([0] * image_count)
                         image_for_gen_loss_flags.extend([0] * image_count)
                         is_image_duplicated_for_und_flags.extend([0] * image_count)
+                        layer_group_ids.extend([-1] * image_count)
+                        layer_indices.extend([-1] * image_count)
                 # gpt turn, we duplicate the generated image for the understanding branch
                 else:
                     image_count = conv["value"].count("<image>")
@@ -623,6 +687,10 @@ class LazySupervisedDataset(Dataset):
                             is_image_duplicated_for_und_flags.extend(
                                 [0, 1] * image_count
                             )
+                            for _ in range(image_count):
+                                layer_group_ids.extend([next_layer_group_id, -1])
+                                layer_indices.extend([0, -1])
+                                next_layer_group_id += 1
                             for cur_image_i in range(image_count):
                                 image_path_list_new.extend(
                                     [
@@ -638,6 +706,10 @@ class LazySupervisedDataset(Dataset):
                             is_image_duplicated_for_und_flags.extend(
                                 [0, 1] * image_count
                             )
+                            for _ in range(image_count):
+                                layer_group_ids.extend([next_layer_group_id, -1])
+                                layer_indices.extend([0, -1])
+                                next_layer_group_id += 1
                             for cur_image_i in range(image_count):
                                 image_path_list_new.extend(
                                     [
@@ -663,6 +735,8 @@ class LazySupervisedDataset(Dataset):
                                 is_image_duplicated_for_und_flags = (
                                     is_image_duplicated_for_und_flags[:-1]
                                 )
+                                layer_group_ids = layer_group_ids[:-1]
+                                layer_indices = layer_indices[:-1]
                                 image_path_list_new = image_path_list_new[:-1]
                             else:
                                 conv["value"] = conv["value"].replace(
@@ -672,6 +746,8 @@ class LazySupervisedDataset(Dataset):
             image_path_list = image_path_list_new
         else:
             is_image_duplicated_for_und_flags = [0] * len(image_path_list)
+            layer_group_ids = [-1] * len(image_path_list)
+            layer_indices = [-1] * len(image_path_list)
             for conv in data_item["conversations"]:
                 if conv["from"] == "gpt" and "<image>" in conv["value"]:
                     assert (
@@ -684,6 +760,8 @@ class LazySupervisedDataset(Dataset):
             image_for_gen_flags,
             image_for_gen_loss_flags,
             is_image_duplicated_for_und_flags,
+            layer_group_ids,
+            layer_indices,
             interleave_not_repeat_last_flag,
             is_cfg_drop_txt,
         )
@@ -736,8 +814,6 @@ class LazySupervisedDataset(Dataset):
         else:
             image_path_list = data_item["images"]
 
-        original_image_path_length = len(image_path_list)
-
         # we process the prompts and optinally do drop conditions for image generation task
         if is_image_gen_task:
             (
@@ -746,6 +822,8 @@ class LazySupervisedDataset(Dataset):
                 image_for_gen_flags,
                 image_for_gen_loss_flags,
                 is_image_duplicated_for_und_flags,
+                layer_group_ids,
+                layer_indices,
                 interleave_not_repeat_last_flag,
                 is_cfg_drop_txt,
             ) = self.image_gen_prepare_conv(
@@ -756,6 +834,8 @@ class LazySupervisedDataset(Dataset):
             image_for_gen_flags = [0] * len(image_path_list)
             image_for_gen_loss_flags = [0] * len(image_path_list)
             is_image_duplicated_for_und_flags = [0] * len(image_path_list)
+            layer_group_ids = [-1] * len(image_path_list)
+            layer_indices = [-1] * len(image_path_list)
 
         # we only append <image> for non image gen data
         if len(image_path_list) == 1 and not is_image_gen_task:
@@ -777,6 +857,15 @@ class LazySupervisedDataset(Dataset):
         assert len(image_for_gen_flags) == len(
             image_path_list
         ), f"Mismatch between number of image files ({len(image_path_list)}) and <image> token ({len(image_for_gen_flags)})"
+        assert len(layer_group_ids) == len(image_path_list)
+        assert len(layer_indices) == len(image_path_list)
+        for is_image_for_gen, layer_group_id, layer_index in zip(
+            image_for_gen_flags, layer_group_ids, layer_indices
+        ):
+            if is_image_for_gen:
+                assert layer_group_id >= 0 and layer_index >= 0
+            else:
+                assert layer_group_id == -1 and layer_index == -1
         if is_image_gen_task:
             assert sum(
                 image_for_gen_flags
@@ -785,6 +874,7 @@ class LazySupervisedDataset(Dataset):
         min_pixels_gen = self.min_pixels_gen
         images, num_tiles = [], []
         image_for_gen_resolutions = []
+        layer_group_canvas_sizes = {}
         num_image = len(image_path_list)
         for image_i, (image_path, is_image_for_gen) in enumerate(
             zip(image_path_list, image_for_gen_flags)
@@ -807,7 +897,7 @@ class LazySupervisedDataset(Dataset):
                 if self.tcs_loader is not None:
                     image = self.tcs_loader(image_path)
                 else:
-                    image = Image.open(image_path).convert("RGB")
+                    image = Image.open(image_path).convert("RGBA")
             except Exception as e:
                 print(
                     f"Fail to Load Image, {self.ds_name}: {self.root} {image_path} for exception: {e}"
@@ -815,12 +905,24 @@ class LazySupervisedDataset(Dataset):
 
             ## for some editing sample, we have to ensure the input and output image has same size
             if (
-                image_i == 0
-                and original_image_path_length == 2
+                not is_image_for_gen
                 and task_type == "mm_it2i"
                 and str(data_item.get("must_same_size", "false")).lower() == "true"
             ):
                 image = image.resize((data_item["width"][-1], data_item["height"][-1]))
+
+            if is_image_for_gen:
+                layer_group_id = layer_group_ids[image_i]
+                canvas_size = image.size
+                if layer_group_id in layer_group_canvas_sizes:
+                    if layer_group_canvas_sizes[layer_group_id] != canvas_size:
+                        raise ValueError(
+                            "All layers in one layer group must share a canvas: "
+                            f"group {layer_group_id} has sizes "
+                            f"{layer_group_canvas_sizes[layer_group_id]} and {canvas_size}."
+                        )
+                else:
+                    layer_group_canvas_sizes[layer_group_id] = canvas_size
 
             if self.dynamic_image_size:
                 if self.dynamic_image_version == "native_resolution":
@@ -949,11 +1051,14 @@ class LazySupervisedDataset(Dataset):
             if not self.enabel_und_loss:
                 ret["labels"][0][:] = IGNORE_INDEX
             else:
-                assert not is_image_duplicated_for_und_flags[
-                    -1
-                ], "never predict <img_end> in t2i and it2i for now"
+                assert not any(
+                    is_image_duplicated_for_und_flags
+                ), "never predict <img_end> in t2i and it2i for now"
                 # no need to predict img_start for now
-                ret["labels"][0][image_start_token_positions[-1] :] = IGNORE_INDEX
+                first_gen_image_idx = image_for_gen_flags.index(1)
+                ret["labels"][0][
+                    image_start_token_positions[first_gen_image_idx] :
+                ] = IGNORE_INDEX
 
         elif task_type == "mm_interleave_gen":
             image_start_token_positions = (
@@ -1002,6 +1107,8 @@ class LazySupervisedDataset(Dataset):
             is_image_duplicated_for_und_flags=torch.tensor(
                 is_image_duplicated_for_und_flags, dtype=torch.bool
             ),
+            layer_group_ids=torch.tensor(layer_group_ids, dtype=torch.long),
+            layer_indices=torch.tensor(layer_indices, dtype=torch.long),
         )
 
         return ret
@@ -1164,6 +1271,8 @@ class LazySupervisedDataset(Dataset):
             is_image_duplicated_for_und_flags=torch.tensor(
                 [0] * num_patches, dtype=torch.bool
             ),
+            layer_group_ids=torch.tensor([-1] * num_patches, dtype=torch.long),
+            layer_indices=torch.tensor([-1] * num_patches, dtype=torch.long),
         )
         return ret
 
@@ -1244,6 +1353,8 @@ class LazySupervisedDataset(Dataset):
             is_image_duplicated_for_und_flags=torch.tensor(
                 [0] * num_patches, dtype=torch.bool
             ),
+            layer_group_ids=torch.tensor([-1] * num_patches, dtype=torch.long),
+            layer_indices=torch.tensor([-1] * num_patches, dtype=torch.long),
             source=ret.get("source", ""),
         )
         return ret

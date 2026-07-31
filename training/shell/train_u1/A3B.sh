@@ -20,7 +20,7 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 
 # ============================ Model & data (placeholders — fill in!) ============================ #
 export CONFIG_NAME="configs/sensenovavl_qwen3_gen/sensenovau1_a3b_mot_sft.py"
-export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/path/to/SenseNova-U1-A3B-MoT-SFT"}
+export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/path/to/SenseNova-U1-A3B-MoT-Layered"}
 export VOCAB_FILE=${VOCAB_FILE:-"/path/to/qwen3/tokenizer"}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-"/path/to/qwen3/tokenizer"}
 export mm_data_path=${mm_data_path:-"data/sample/sample_data_meta.json"}
@@ -74,7 +74,7 @@ export MM_CC_DATA_WEIGHTS=0
 export freeze_llm=false
 export freeze_backbone=false
 export unfreeze_mot_gen=true
-export mot_random_init=false  # SenseNova-U1-A3B-MoT-SFT already has the MoT generation branch
+export mot_random_init=false  # The checkpoint must contain the RGBA MoT generation branch.
 
 # ============================ Generation / diffusion ============================ #
 export time_schedule="standard"
@@ -90,6 +90,8 @@ export add_noise_scale_embedding=true
 export noise_scale_max_value=8
 export P_mean=-0.8
 export P_std=0.8
+export rgb_weight=${rgb_weight:-1.0}
+export alpha_weight=${alpha_weight:-1.0}
 export cfg_txt_uncond_drop_prob=0.1
 export cfg_img_uncond_drop_prob=0
 export cfg_txtimg_uncond_drop_prob=0.1

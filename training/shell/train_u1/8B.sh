@@ -20,9 +20,9 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 
 # ============================ Model & data (placeholders — fill in!) ============================ #
 export CONFIG_NAME="configs/sensenovavl_qwen3_gen/sensenovau1_8b_mot_sft.py"
-export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
-export VOCAB_FILE=${VOCAB_FILE:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
+export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/models/SenseNova-U1-8B-MoT-Layered"}
+export VOCAB_FILE=${VOCAB_FILE:-"/models/SenseNova-U1-8B-MoT-Layered"}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-"/models/SenseNova-U1-8B-MoT-Layered"}
 export mm_data_path=${mm_data_path:-"/datasets/data_zsqiao/image_gen_v3/metadata_sensenova_meta.json"}
 export load_optimizer=${load_optimizer:-"model"}
 
@@ -85,6 +85,8 @@ export add_noise_scale_embedding=true
 export noise_scale_max_value=8
 export P_mean=-0.8
 export P_std=0.8
+export rgb_weight=${rgb_weight:-1.0}
+export alpha_weight=${alpha_weight:-1.0}
 export cfg_txt_uncond_drop_prob=0.1
 export cfg_img_uncond_drop_prob=0
 export cfg_txtimg_uncond_drop_prob=0.1

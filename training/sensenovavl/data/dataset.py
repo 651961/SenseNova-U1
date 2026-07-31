@@ -239,7 +239,7 @@ def read_frames_folder(
         frame_indices = get_frame_indices(t_num_frames, vlen, sample=sample, fix_start=fix_start)
         frames = [frames[i] for i in frame_indices]
     # read frames
-    frames = [Image.open(f).convert("RGB") for f in frames]
+    frames = [Image.open(f).convert("RGBA") for f in frames]
     return frames
 
 
@@ -262,7 +262,7 @@ class WeightedConcatDataset(ConcatDataset):
 def pil_loader(img_str):
     buff = io.BytesIO(img_str)
     img = Image.open(buff)
-    return img.convert("RGB")
+    return img.convert("RGBA")
 
 
 class TCSLoader(object):
@@ -279,7 +279,7 @@ class TCSLoader(object):
 
     def __call__(self, fn, image_type="image", max_num_frames=-1, min_num_frames=4, sample="rand", clip=None):
         if image_type == "image":
-            return Image.open(fn).convert("RGB")
+            return Image.open(fn).convert("RGBA")
 
         elif image_type == "video":
             fps = None
@@ -300,6 +300,8 @@ class TCSLoader(object):
 
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
+    if pil_img.mode == "RGBA" and len(background_color) == 3:
+        background_color = (*background_color, 255)
     if width == height:
         return pil_img
     elif width > height:
@@ -314,10 +316,13 @@ def expand2square(pil_img, background_color):
 
 def simulate_jpeg_degradation(quality):
     def jpeg_degrade(img):
+        rgba = img.convert("RGBA")
+        alpha = rgba.getchannel("A")
         with io.BytesIO() as output:
-            img.convert("RGB").save(output, format="JPEG", quality=quality)
+            rgba.convert("RGB").save(output, format="JPEG", quality=quality)
             output.seek(0)  # Move the reading cursor to the start of the stream
             img_jpeg = Image.open(output).copy()  # Use .copy() to make sure the image is loaded in memory
+        img_jpeg.putalpha(alpha)
         return img_jpeg
 
     return jpeg_degrade
@@ -337,24 +342,26 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type="imag
         MEAN, STD = SIGLIP_MEAN, SIGLIP_STD
     else:
         raise NotImplementedError
+    rgba_mean = (*MEAN, 0.0)
+    rgba_std = (*STD, 1.0)
     if is_train:  # use data augumentation
         if resize:
             transform = T.Compose(
                 [
-                    T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                    T.Lambda(lambda img: img.convert("RGBA") if img.mode != "RGBA" else img),
                     T.RandomChoice([T.Lambda(jpeg_degrade_functions[quality]) for quality in qualities]),
                     T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
                     T.ToTensor(),
-                    T.Normalize(mean=MEAN, std=STD),
+                    T.Normalize(mean=rgba_mean, std=rgba_std),
                 ]
             )
         else:  # only for native resolution
             transform = T.Compose(
                 [
-                    T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                    T.Lambda(lambda img: img.convert("RGBA") if img.mode != "RGBA" else img),
                     T.RandomChoice([T.Lambda(jpeg_degrade_functions[quality]) for quality in qualities]),
                     T.ToTensor(),
-                    T.Normalize(mean=MEAN, std=STD),
+                    T.Normalize(mean=rgba_mean, std=rgba_std),
                 ]
             )
     else:
@@ -362,29 +369,29 @@ def build_transform(is_train, input_size, pad2square=False, normalize_type="imag
             if resize:
                 transform = T.Compose(
                     [
-                        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                        T.Lambda(lambda img: img.convert("RGBA") if img.mode != "RGBA" else img),
                         T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
                         T.ToTensor(),
-                        T.Normalize(mean=MEAN, std=STD),
+                        T.Normalize(mean=rgba_mean, std=rgba_std),
                     ]
                 )
             else: # only for native resolution
                 transform = T.Compose(
                     [
-                        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                        T.Lambda(lambda img: img.convert("RGBA") if img.mode != "RGBA" else img),
                         T.ToTensor(),
-                        T.Normalize(mean=MEAN, std=STD),
+                        T.Normalize(mean=rgba_mean, std=rgba_std),
                     ]
                 )
 
         else:
             transform = T.Compose(
                 [
-                    T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                    T.Lambda(lambda img: img.convert("RGBA") if img.mode != "RGBA" else img),
                     T.Lambda(lambda img: expand2square(img, tuple(int(x * 255) for x in MEAN))),
                     T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
                     T.ToTensor(),
-                    T.Normalize(mean=MEAN, std=STD),
+                    T.Normalize(mean=rgba_mean, std=rgba_std),
                 ]
             )
 
@@ -699,6 +706,10 @@ def preprocess_pixel_values(pixel_values, patch_size=16):
 
     for idx, px in enumerate(pixel_values):
         c, h, w = px.shape
+        if c != 4:
+            raise ValueError(
+                f"Expected RGBA tensor for image {idx}, got {c} channels."
+            )
         grid_h = h // patch_size
         grid_w = w // patch_size
 

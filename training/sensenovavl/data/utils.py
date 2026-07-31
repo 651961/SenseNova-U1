@@ -18,7 +18,7 @@ def padding_images(images=None):
         num_padding_images = max_num_images.item() - cur_num_images
         if num_padding_images > 0:
             image_size = gpc.config.data.force_image_size
-            padding_images = torch.zeros((num_padding_images, 3, image_size, image_size), dtype=torch.float32)
+            padding_images = torch.zeros((num_padding_images, 4, image_size, image_size), dtype=torch.float32)
             if images is None:
                 images = padding_images
             else:

@@ -89,6 +89,8 @@ def get_model(model_args, data_args):
         img_start_token_id=data_args.get("img_start_token_id", None),
         force_image_size=data_args.force_image_size,
         image_gen_loss_weight=gpc.config.loss.get("image_gen_loss_coef", 0.0),
+        rgb_weight=gpc.config.loss.get("rgb_weight", 1.0),
+        alpha_weight=gpc.config.loss.get("alpha_weight", 1.0),
         timestep_shift=model_args.timestep_shift,
         time_schedule=model_args.time_schedule,
         time_shift_type=model_args.time_shift_type,
