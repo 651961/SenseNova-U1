@@ -35,7 +35,6 @@ from .dataset_interleaved_iterable import (
     internevo_collate_fn,
 )
 import mmap
-from io import TextIOWrapper
 
 from .t2i_prompts import T2I_EDITING_SYSTEM_MESSAGE
 from .cfg_cond_drop_utils import *
@@ -139,6 +138,12 @@ class LazySupervisedDataset(Dataset):
         self.tcs_loader = tcs_loader
         self.group_by_length = group_by_length
         self.force_shuffle = force_shuffle
+        # ``random_seed`` used to be accepted but was never applied.  Keep the
+        # seed on the dataset so that every worker can build the same
+        # permutation for a given epoch and then take a disjoint slice of it.
+        self.seed = int(random_seed)
+        self.epoch = 0
+        self._resume_position = 0
         self.dynamic_image_size = dynamic_image_size
         self.dynamic_image_version = dynamic_image_version
         if self.dynamic_image_version is None:
@@ -164,12 +169,21 @@ class LazySupervisedDataset(Dataset):
         self.meta = meta
 
         self.annotation_file = meta["annotation"]
+        self.dataset_replacement = gpc.config.dataset_replacement
 
         self.length = math.ceil(meta["length"] * meta["repeat_time"])
 
         self.repeat_time = repeat_time
 
         self.raw_data = []
+
+        # Build a byte-offset table once in the parent process.  The table is
+        # inherited by forked DataLoader workers, so a new epoch does not scan
+        # the whole JSONL file again and no JSON objects/images are retained.
+        self._line_offsets = None
+        self._ensure_line_offsets()
+        if not self.dataset_replacement:
+            self.length = min(self.length, len(self._line_offsets))
 
         self.type_id = type_id
         self.type2typeid = type2typeid
@@ -192,7 +206,13 @@ class LazySupervisedDataset(Dataset):
         self.enabel_und_loss = enabel_und_loss
         self.language = language
 
-        self._state_dict = {"file_shift": 0, "bytes_offset": 0, "line_shift": 0}
+        self._state_dict = {
+            "file_shift": 0,
+            "bytes_offset": 0,
+            "line_shift": 0,
+            "epoch": self.epoch,
+            "epoch_position": 0,
+        }
 
         if self.group_by_length:
             raise NotImplementedError
@@ -203,10 +223,32 @@ class LazySupervisedDataset(Dataset):
             raise ValueError(f"template_name {self.template_name}")
 
         self.preprocess_function = preprocess_function
-        self.dataset_replacement = gpc.config.dataset_replacement
 
     def load_state_dict(self, state_dict):
         self._state_dict.update(state_dict)
+        if "epoch" in state_dict:
+            self.epoch = int(state_dict["epoch"])
+        self._resume_position = max(int(state_dict.get("epoch_position", 0)), 0)
+
+    def set_epoch(self, epoch):
+        """Select the deterministic shuffle order for ``epoch``.
+
+        ``DataLoader`` creates fresh workers for each epoch in the 8B
+        configuration, so keeping this state on the dataset is sufficient and
+        avoids a second sampler object for the iterable packing path.
+        """
+
+        self.epoch = int(epoch)
+        self._resume_position = 0
+        self._state_dict.update(
+            {
+                "epoch": self.epoch,
+                "epoch_position": 0,
+                "file_shift": 0,
+                "bytes_offset": 0,
+                "line_shift": 0,
+            }
+        )
 
     def _get_mmap(self, data_path):
 
@@ -219,6 +261,24 @@ class LazySupervisedDataset(Dataset):
             raise e
         self.handles = [f, mm]
         return self.handles[-1]
+
+    def _ensure_line_offsets(self):
+        """Build and cache byte offsets for all records in the JSONL file."""
+
+        if self._line_offsets is not None:
+            return self._line_offsets
+
+        offsets = []
+        with open(self.annotation_file, "rb") as annotation_file:
+            while True:
+                offset = annotation_file.tell()
+                line = annotation_file.readline()
+                if not line:
+                    break
+                offsets.append(offset)
+
+        self._line_offsets = offsets
+        return offsets
 
     def __len__(self):
         return self.length
@@ -1292,82 +1352,96 @@ class LazySupervisedDataset(Dataset):
         self,
     ):
         # reset
+        self._resume_position = 0
         self._state_dict = {
             "file_shift": 0,
             "bytes_offset": 0,
             "line_shift": 0,  # 用于整体的文件行数计数
+            "epoch": self.epoch,
+            "epoch_position": 0,
         }
 
-    def __iter__(self):  # NOTE:
+    def __iter__(self):
+        """Iterate over one shuffled, non-repeating epoch.
+
+        A single permutation is derived from ``seed + epoch`` on every rank
+        and worker.  Taking ``permutation[worker_id::num_workers]`` means that
+        the union of all workers is exactly the permutation, with no overlap.
+        The old implementation used a modulo shard while reading the file in
+        order and then restarted the iterator, which silently repeated data.
+        """
+
         self._enable_worker_distributed()
 
-        worker_id = 0 if get_worker_info() is None else get_worker_info().id
-        num_workers = 1 if get_worker_info() is None else get_worker_info().num_workers
+        worker_info = get_worker_info()
+        local_worker_id = 0 if worker_info is None else worker_info.id
+        local_num_workers = 1 if worker_info is None else worker_info.num_workers
 
-        self.worker_id = worker_id = num_workers * self.data_rank + worker_id
-        self.num_workers = num_workers = num_workers * self.data_world_size
+        # ``data_rank`` is the rank inside the DATA process group.  Combine it
+        # with the local worker id to obtain one global worker id.
+        worker_id = local_num_workers * self.data_rank + local_worker_id
+        num_workers = max(local_num_workers * self.data_world_size, 1)
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        self.worker_state_key = f"work_state_{worker_id}"
 
-        self.worker_state_key = f"work_state_{self.worker_id}"
+        line_offsets = self._ensure_line_offsets()
+        raw_line_count = len(line_offsets)
+        if raw_line_count == 0 or self.length <= 0:
+            logger.info(f"[{worker_id}] dataset {self.ds_name} is empty")
+            return
 
-        repeat_time = math.ceil(self.repeat_time)  # 文件需要打开的次数
+        # In finite (no-replacement) mode, an epoch is a set of physical JSONL
+        # records, regardless of an old repeat_time/oversampling value in the
+        # metadata.  Replacement mode keeps the legacy repeated logical
+        # records when the enclosing packer explicitly requests it.
+        repeat_count = max(math.ceil(self.repeat_time), 1)
+        replacement_enabled = bool(getattr(self, "dataset_replacement", False))
+        max_logical_length = (
+            raw_line_count
+            if not replacement_enabled
+            else raw_line_count * repeat_count
+        )
+        logical_length = min(self.length, max_logical_length)
+        if logical_length <= 0:
+            return
 
-        file_shift = self._state_dict["file_shift"]
+        rng = np.random.default_rng(self.seed + self.epoch)
+        permutation = rng.permutation(logical_length)
+        worker_indices = permutation[worker_id::num_workers]
+        start_position = min(self._resume_position, len(worker_indices))
+        # A loaded checkpoint resumes once; subsequent epoch iterators start
+        # from the beginning after ``set_epoch`` resets this value.
+        self._resume_position = 0
 
-        if file_shift >= repeat_time:
-            # the dataset should have been used up
-            self.reset()
-            raise StopIteration
-
-        for file_idx in range(file_shift, repeat_time):
-            file: TextIOWrapper = self._get_mmap(self.annotation_file)
-            file.seek(0, 0)
-            relative_offset = self._state_dict["bytes_offset"] - file.tell()
-            assert (
-                relative_offset >= 0
-            ), f"Invalid offset {relative_offset} in file {self.annotation_file}"
-            file.seek(relative_offset, 1)
-
-            line_offset = -1  # 用于文件内部计数
-            for line_offset, line in enumerate(iter(file.readline, b"")):
-                old_bytes_offset = self._state_dict["bytes_offset"]
-                old_line_shift = self._state_dict["line_shift"]
-
-                self._state_dict["bytes_offset"] = file.tell()
-                self._state_dict["line_shift"] += 1
-                file.madvise(mmap.MADV_DONTNEED, 0, file.tell())
-
-                if old_line_shift % num_workers == worker_id:
-                    # next_sample = self.get_sample(line)
-                    # if next_sample is not None:
-                    #     next_sample['meta_info'] = deepcopy(self._state_dict)
-                    #     yield next_sample
-                    # yield string instead of sample to save memory usage
-                    if self.get_sample(line):
-                        yield line
-
-                if (
-                    self._state_dict["line_shift"] >= self.length
-                    and not self.dataset_replacement
-                ):
-                    break
-
-            # if gpc.is_rank_for_log():
-            #     logger.info(f"[{worker_id}] dataset {self.ds_name} datafile {self.annotation_file} has been used up for {file_idx} time & the end line is {self._state_dict['line_shift']}")
-
-            self._state_dict["file_shift"] += 1
-            self._state_dict["bytes_offset"] = 0
-
-            if (
-                self._state_dict["line_shift"] >= self.length
-                and not self.dataset_replacement
+        with open(self.annotation_file, "rb") as annotation_file:
+            for epoch_position, logical_index in enumerate(
+                worker_indices[start_position:], start=start_position + 1
             ):
-                break
+                logical_index = int(logical_index)
+                raw_index = logical_index % raw_line_count
+                annotation_file.seek(line_offsets[raw_index])
+                line = annotation_file.readline()
 
-        # if gpc.is_rank_for_log():
+                self._state_dict.update(
+                    {
+                        "epoch": self.epoch,
+                        "epoch_position": epoch_position,
+                        "file_shift": logical_index // raw_line_count,
+                        "bytes_offset": annotation_file.tell(),
+                        "line_shift": logical_index + 1,
+                    }
+                )
+
+                # Keep the historical contract of yielding JSONL bytes.  The
+                # packing dataset parses the line after it has been selected.
+                # Validation here prevents malformed records from terminating
+                # an epoch, while each logical record is still visited at most
+                # once.
+                if self.get_sample(line) is not None:
+                    yield line
+
         logger.info(f"[{worker_id}] dataset {self.ds_name} has been ran out of!!!")
-
-        self.reset()
-        raise StopIteration
 
 
 def get_dataset_type_ids_map(ds_collections, type_id_offset):
@@ -1429,6 +1503,7 @@ def build_datasets(
     max_num_frame=24,
     data_augment=True,
     type_id_offset=0,
+    seed=42,
 ):
     datasets = []
     lengths = []
@@ -1552,7 +1627,7 @@ def build_datasets(
                 min_num_frame=min_num_frame,
                 max_num_frame=max_num_frame,
                 repeat_time=ds_collections[ds_name]["repeat_time"],
-                random_seed=ds_idx,
+                random_seed=int(seed) + ds_idx,
                 type_id=ds2typeid[ds_name],
                 type2typeid=type2typeid,
                 candidate_resolutions_for_gen=getattr(

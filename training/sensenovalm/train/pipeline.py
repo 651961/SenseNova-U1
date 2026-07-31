@@ -10,6 +10,7 @@ import time
 from typing import Callable, Dict, Iterable, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -571,6 +572,74 @@ def get_scheduler_hooks(metric, zero_optim, isp_communicator_wrapper) -> List[Sc
 LAST_BATCH = None
 
 
+def _synchronize_finite_epoch(train_dl: DataLoader, local_exhausted: bool) -> bool:
+    """Tell all DATA ranks when any finite packed iterator reaches its end.
+
+    The pack limit is fixed (``max_packed_tokens``; 25800 in the 8B config),
+    but source records have different lengths, so ranks need not produce the
+    same number of packs from their disjoint raw-sample shards.  A scalar MAX
+    reduction keeps every rank on the same epoch before the next
+    forward/backward collective.
+    Non-packed/legacy loaders do not opt into this path.
+    """
+
+    dataset = getattr(train_dl, "dataset", None)
+    if not getattr(dataset, "synchronize_epoch", False):
+        return local_exhausted
+    if not dist.is_available() or not dist.is_initialized():
+        return local_exhausted
+    if not gpc.is_initialized(ParallelMode.DATA):
+        return local_exhausted
+
+    data_world_size = gpc.get_world_size(ParallelMode.DATA)
+    if data_world_size <= 1:
+        return local_exhausted
+    data_group = gpc.get_group(ParallelMode.DATA)
+    if data_group is None:
+        return local_exhausted
+
+    # Gloo (and MPI) process groups reduce CPU tensors.  Do not blindly use
+    # ``get_current_device()`` here: on hosts where CUDA is visible, that can
+    # initialize CUDA even though this particular group is a CPU group (and
+    # is especially problematic in forked smoke tests).  NCCL/HCCL-style
+    # groups require the accelerator device instead.
+    try:
+        backend = str(dist.get_backend(data_group)).lower()
+    except RuntimeError:
+        backend = ""
+    collective_device = (
+        torch.device("cpu")
+        if backend in {"gloo", "mpi"}
+        else get_current_device()
+    )
+    exhausted = torch.tensor([int(local_exhausted)], dtype=torch.int32, device=collective_device)
+    dist.all_reduce(
+        exhausted,
+        op=dist.ReduceOp.MAX,
+        group=data_group,
+    )
+    return bool(exhausted.item())
+
+
+def _start_next_data_epoch(train_dl: DataLoader, train_state: TrainState):
+    """Advance trainer/dataloader state together at a finite epoch boundary."""
+
+    train_state.num_consumed_samples_in_epoch = 0
+    train_state.curr_epoch += 1
+
+    dataset = getattr(train_dl, "dataset", None)
+    set_epoch = getattr(dataset, "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(train_state.curr_epoch)
+
+    logger.info(f"Epoch {train_state.curr_epoch} starts!")
+    if hasattr(train_state, "batch_sampler"):
+        train_state.batch_sampler.batch_count = 0
+        train_state.batch_sampler.num_consumed_samples_in_epoch = 0
+        train_state.batch_sampler_iter = iter(train_state.batch_sampler)
+        next(train_state.batch_sampler_iter)
+
+
 @llm_timeout(func_name="load_new_batch")
 def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: TrainState):
     """
@@ -584,35 +653,47 @@ def load_new_batch(train_dl: DataLoader, train_iter: Iterable, train_state: Trai
     Returns: A batch data and the updated train_iter.
     """
 
-    timer("batch-gen").start()
-    try:
-        batch = next(train_iter)  # structure is ({'input_ids': Tensor, 'cu_seqlens': Tensor}, Tensor)
-        if hasattr(train_state, "batch_sampler_iter"):
-            next(train_state.batch_sampler_iter)
+    global LAST_BATCH
 
-        global LAST_BATCH
-        if LAST_BATCH is None:
-            LAST_BATCH = copy.deepcopy(batch)
+    allow_empty_data = getattr(train_dl.dataset, "allow_empty_data", False)
+    synchronize_epoch = getattr(train_dl.dataset, "synchronize_epoch", False) and not allow_empty_data
 
-    except StopIteration:
-        allow_empty_data = getattr(train_dl.dataset, "allow_empty_data", False)
-        if allow_empty_data:
-            print("note allow empty data is true")
-            batch = copy.deepcopy(LAST_BATCH)
-            batch[0]["is_empty_data_list"] = True
-            batch[1] = torch.full_like(batch[1], IGNORE_TOKEN_ID)
-        else:
-            train_iter = iter(train_dl)
-            batch = next(train_iter)
-            train_state.num_consumed_samples_in_epoch = 0
-            train_state.curr_epoch += 1
-            logger.info(f"Epoch {train_state.curr_epoch} starts!")
-            if hasattr(train_state, "batch_sampler"):
-                train_state.batch_sampler.batch_count = 0
-                train_state.batch_sampler.num_consumed_samples_in_epoch = 0
-                train_state.batch_sampler_iter = iter(train_state.batch_sampler)
+    while True:
+        timer("batch-gen").start()
+        local_exhausted = False
+        try:
+            batch = next(train_iter)  # structure is ({'input_ids': Tensor, 'cu_seqlens': Tensor}, Tensor)
+            if hasattr(train_state, "batch_sampler_iter"):
                 next(train_state.batch_sampler_iter)
-    timer("batch-gen").stop()
+        except StopIteration:
+            local_exhausted = True
+            batch = None
+
+        # All ranks must participate, including ranks that did receive a
+        # batch: if one rank is exhausted, discard the other ranks' tail batch
+        # and restart the iterator at the same new epoch.
+        if synchronize_epoch and _synchronize_finite_epoch(train_dl, local_exhausted):
+            timer("batch-gen").stop()
+            _start_next_data_epoch(train_dl, train_state)
+            train_iter = iter(train_dl)
+            continue
+
+        if local_exhausted:
+            if allow_empty_data:
+                print("note allow empty data is true")
+                batch = copy.deepcopy(LAST_BATCH)
+                batch[0]["is_empty_data_list"] = True
+                batch[1] = torch.full_like(batch[1], IGNORE_TOKEN_ID)
+            else:
+                _start_next_data_epoch(train_dl, train_state)
+                train_iter = iter(train_dl)
+                batch = next(train_iter)
+
+        timer("batch-gen").stop()
+        break
+
+    if LAST_BATCH is None:
+        LAST_BATCH = copy.deepcopy(batch)
 
     if batch[0].get("type_ids", None) is not None:
         # if use_packed_dataset is False, we need to unpack type_ids

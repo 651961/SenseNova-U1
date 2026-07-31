@@ -23,7 +23,7 @@ export CONFIG_NAME="configs/sensenovavl_qwen3_gen/sensenovau1_8b_mot_sft.py"
 export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
 export VOCAB_FILE=${VOCAB_FILE:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-"/models/SenseNova-U1-8B-MoT-Infographic-V3"}
-export mm_data_path=${mm_data_path:-"data/sample/sample_data_meta.json"}
+export mm_data_path=${mm_data_path:-"/datasets/data_zsqiao/image_gen_v3/metadata_sensenova_meta.json"}
 export load_optimizer=${load_optimizer:-"model"}
 
 # resume (uncomment to enable)
@@ -39,20 +39,20 @@ export pp_size=1
 
 # ============================ Optimization ============================ #
 export SEED=42
-export lr=2e-4
-export lr_scheduler_type="constant"
+export lr=2e-5
+export lr_scheduler_type="constant_with_warmup"
 export min_lr_ratio=0.5
 export mlp_lr_scale=1.0
 export weight_decay=0
 export grad_accm=1
 export total_steps=200000
-export init_steps=2000
+export init_steps=20
 
 # ============================ Data / sequence ============================ #
 export num_imgs=144
-export seq_len=28672
-export max_sample_tokens=28672
-export dataset_replacement=true
+export seq_len=25800
+export max_sample_tokens=25800
+export dataset_replacement=false
 export min_num_frame=1
 export max_num_frame=128
 export dynamic_image_version="native_resolution"
@@ -60,15 +60,15 @@ export CONV_STYLE="sensenovalm2-chat-v3"
 export down_sample_ratio=0.5
 export max_pixels=$((2048 * 2048))
 export min_pixels=$((256 * 256))
-export max_pixels_gen=$((512 * 512))
-export min_pixels_gen=$((256 * 256))
+export max_pixels_gen=$((2048 * 2048))
+export min_pixels_gen=$((2048 * 2048))
 export LLM_DATA_WEIGHTS=0
 export MM_CC_DATA_WEIGHTS=0
 
 # ============================ Freeze / trainable modules ============================ #
-export mot_random_init=true
-export freeze_llm=false
-export freeze_backbone=false
+export mot_random_init=false
+export freeze_llm=true
+export freeze_backbone=true
 export unfreeze_mot_gen=true
 
 # ============================ Generation / diffusion ============================ #

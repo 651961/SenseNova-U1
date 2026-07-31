@@ -292,18 +292,6 @@ class BaseDataset(IterableDataset):
 
         worker_id = local_num_workers * self.data_rank + local_worker_id
         num_workers = local_num_workers * self.data_world_size
-        shard_worker_id = worker_id
-        if num_workers > 1:
-            # Avoid over-sharding small datasets into mostly-empty worker partitions.
-            min_samples_per_worker = max(
-                int(gpc.config.data.get("worker_distributed_min_samples_per_worker", 16)),
-                1,
-            )
-            num_workers = min(
-                num_workers,
-                max(1, math.ceil(self.length / min_samples_per_worker)),
-            )
-            shard_worker_id = worker_id % num_workers
 
         self.worker_id = worker_id
         self.num_workers = num_workers
@@ -315,7 +303,7 @@ class BaseDataset(IterableDataset):
         if self._state_dict['file_shift'] >= repeat_time*self.end_file_idx:
             # the dataset is exhausted
             self.reset()
-            raise StopIteration
+            return
         
         file_shift = self._state_dict['file_shift']
         # for file_idx in range(self.start_file_idx + file_shift, self.end_file_idx):
@@ -374,7 +362,7 @@ class BaseDataset(IterableDataset):
         logger.info(f"[{worker_id}] dataset {self.ds_name} has been ran out of!!!")
 
         self.reset()
-        raise StopIteration
+        return
             
 
 class ImageTextPairDataset(BaseDataset):
@@ -820,6 +808,10 @@ class InterleavedDataset(BaseDataset):
            
 
 # NOTE:
+class _DatasetExhausted(Exception):
+    """Internal signal that one finite child dataset reached epoch end."""
+
+
 class PackedDataset(IterableDataset):
     """PackedDataset"""
 
@@ -842,6 +834,7 @@ class PackedDataset(IterableDataset):
         allow_deduplicated_ds_name: bool = False,
         nlp_mm_sampling_fixed_token: bool = False,
         packed_buffer_stale_threshold: int = 200,
+        seed: int = 42,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -858,6 +851,13 @@ class PackedDataset(IterableDataset):
             assert self.strict_mode == False, "strict_mode should be False when dynamic_image_version is native_resolution"
         self.debug_mode = debug_mode
         self.replacement = replacement
+        self.seed = int(seed)
+        self.epoch = 0
+        # Used by the training loop to synchronize epoch boundaries across
+        # data-parallel ranks.  Packing variable-length records can produce a
+        # different number of fixed-limit packs per rank even though the raw
+        # samples are sharded evenly.
+        self.synchronize_epoch = not self.replacement
         self.allow_overflow = allow_overflow
         self.allow_empty_data = allow_empty_data
         self.packed_buffer_stale_threshold = max(int(packed_buffer_stale_threshold), 1)
@@ -927,10 +927,35 @@ class PackedDataset(IterableDataset):
         if self.allow_empty_data:
             logger.warning("allow_empty_data is enabled, note that empty data may be generated!")
 
+    def set_epoch(self, epoch):
+        """Set the epoch for this packer and all epoch-aware child datasets."""
+
+        self.epoch = int(epoch)
+        self.dataset_iter_list = None
+        self.datasets = list(self.datasets_orig)
+        self.dataset_weight = list(self.dataset_weight_orig)
+        self._state_dict["sample_info"] = {d.ds_name: 0 for d in self.datasets}
+        for dataset in self.datasets:
+            self._state_dict[dataset.ds_name] = {}
+
+        for dataset in self.datasets:
+            if hasattr(dataset, "dataset_replacement"):
+                dataset.dataset_replacement = self.replacement
+            set_epoch = getattr(dataset, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(self.epoch)
+
     def load_state_dict(self, state_dict, custom_infos=None):
-
-
         self.resume_state_dict.update(state_dict)
+        # Restore the epoch number before workers are created; otherwise the
+        # epoch-aware child datasets would be reset to epoch 0 on resume.
+        for dataset_state in state_dict.values():
+            if not isinstance(dataset_state, dict):
+                continue
+            for worker_state in dataset_state.values():
+                if isinstance(worker_state, dict) and "epoch" in worker_state:
+                    self.epoch = int(worker_state["epoch"])
+                    return
         
 
     def _should_log(self):
@@ -942,73 +967,95 @@ class PackedDataset(IterableDataset):
 
         return worker_id == 0
 
+    def _next_child_item(self, current_dataset_idx):
+        """Read one child item and account for it in this worker's epoch."""
+
+        item = next(self.dataset_iter_list[current_dataset_idx])
+        remaining = getattr(self, "_remaining_counts", None)
+        if remaining is not None and remaining[current_dataset_idx] is not None:
+            remaining[current_dataset_idx] = max(remaining[current_dataset_idx] - 1, 0)
+        return item
+
+    def _get_sampling_weights(self):
+        """Return source weights adjusted for records left in this worker."""
+
+        remaining = getattr(self, "_remaining_counts", None)
+        initial = getattr(self, "_initial_remaining_counts", None)
+        if remaining is None or initial is None:
+            return list(self.dataset_weight)
+
+        weights = []
+        for idx, base_weight in enumerate(self.dataset_weight):
+            left = remaining[idx]
+            total = initial[idx]
+            if left is None or total is None:
+                weights.append(base_weight)
+            elif total <= 0:
+                weights.append(0.0)
+            else:
+                weights.append(base_weight * left / total)
+        return weights
+
+    def _read_sample(self, current_dataset_idx):
+        """Read and parse one item from a child iterator."""
+
+        dataset = self.datasets[current_dataset_idx]
+        if isinstance(dataset, sensenovavl.data.dataset_interleaved_iterable.BaseDataset):
+            line = self._next_child_item(current_dataset_idx)
+            samples = dataset.get_sample(line)
+            if not samples:
+                return None
+            current_sample = samples[0]
+            current_sample["type_ids"] = torch.zeros_like(current_sample["input_ids"]) + dataset.type_id
+            current_sample["meta_info"] = copy.deepcopy(dataset._state_dict)
+            return current_sample
+
+        if isinstance(dataset, sensenovavl.data.multimodal_dataset.LazySupervisedDataset):
+            line = self._next_child_item(current_dataset_idx)
+            current_sample = dataset.get_sample(line)
+            if current_sample is None:
+                return None
+            current_sample["meta_info"] = copy.deepcopy(dataset._state_dict)
+            return current_sample
+
+        return self._next_child_item(current_dataset_idx)
+
     def next_data(self, current_dataset_idx):
+        dataset = self.datasets[current_dataset_idx]
         try:
-            if isinstance(self.datasets[current_dataset_idx], sensenovavl.data.dataset_interleaved_iterable.BaseDataset):
-                line = next(self.dataset_iter_list[current_dataset_idx])
-                current_sample = self.datasets[current_dataset_idx].get_sample(line)[0]
-                current_sample["type_ids"] = (
-                    torch.zeros_like(current_sample["input_ids"]) + self.datasets[current_dataset_idx].type_id
-                )
-                current_sample["meta_info"] = copy.deepcopy(self.datasets[current_dataset_idx]._state_dict)
-            elif isinstance(self.datasets[current_dataset_idx], sensenovavl.data.multimodal_dataset.LazySupervisedDataset):
-                line = next(self.dataset_iter_list[current_dataset_idx])
-                current_sample = self.datasets[current_dataset_idx].get_sample(line)
-                current_sample["meta_info"] = copy.deepcopy(self.datasets[current_dataset_idx]._state_dict)
-            else:
-                current_sample = next(self.dataset_iter_list[current_dataset_idx])
-        except Exception as e:
-            logger.error(f"Dataloader caught exception type  {type(e)} which is: {e}")
-            # except StopIteration:/
-            if self.replacement:
-                logger.info(
-                    f"[Worker id {self.worker_id}] Dataset {self.datasets[current_dataset_idx].ds_name} "
-                    "is exhausted, restart it."
-                )
-
-                try:
-                    self.dataset_iter_list[current_dataset_idx] = iter(self.datasets[current_dataset_idx])
-                    if isinstance(
-                        self.datasets[current_dataset_idx], sensenovavl.data.dataset_interleaved_iterable.BaseDataset
-                    ):
-                        line = next(self.dataset_iter_list[current_dataset_idx])
-                        current_sample = self.datasets[current_dataset_idx].get_sample(line)[0]
-                        current_sample["type_ids"] = (
-                            torch.zeros_like(current_sample["input_ids"]) + self.datasets[current_dataset_idx].type_id
-                        )
-                        current_sample["meta_info"] = copy.deepcopy(self.datasets[current_dataset_idx]._state_dict)
-                    elif isinstance(
-                        self.datasets[current_dataset_idx], sensenovavl.data.multimodal_dataset.LazySupervisedDataset
-                    ):
-                        line = next(self.dataset_iter_list[current_dataset_idx])
-                        current_sample = self.datasets[current_dataset_idx].get_sample(line)
-                        current_sample["meta_info"] = copy.deepcopy(self.datasets[current_dataset_idx]._state_dict)
-                    else:
-                        current_sample = next(self.dataset_iter_list[current_dataset_idx])
-                except Exception as e:
-                    logger.error(f"{self.worker_id=} Fail to get any data from {self.datasets[current_dataset_idx].ds_name} with error {type(e)} {e}!")
-                    self.dataset_weight[current_dataset_idx] = 0
-
-
-                    # if len(self.datasets) == 0:
-                    if all(weight == 0 for weight in self.dataset_weight):
-                        logger.info(f"[Worker id {self.worker_id}] All Datasets are exhausted, restart them.")
-                        self.dataset_weight = [w for w in self.dataset_weight_orig]
-                        self.dataset_iter_list = [iter(d) for d in self.datasets]
-
-                    return None
-            else:
-                logger.error(f"{self.worker_id=} Fail to get any data from {self.datasets[current_dataset_idx].ds_name}!")
+            current_sample = self._read_sample(current_dataset_idx)
+        except StopIteration as exc:
+            if getattr(self, "_remaining_counts", None) is not None:
+                self._remaining_counts[current_dataset_idx] = 0
+            if not self.replacement:
                 self.dataset_weight[current_dataset_idx] = 0.0
+                raise _DatasetExhausted from exc
 
+            logger.info(
+                f"[Worker id {self.worker_id}] Dataset {dataset.ds_name} "
+                "is exhausted, restart it."
+            )
+            self.dataset_iter_list[current_dataset_idx] = iter(dataset)
+            if getattr(self, "_remaining_counts", None) is not None:
+                self._remaining_counts[current_dataset_idx] = self._initial_remaining_counts[current_dataset_idx]
+            try:
+                current_sample = self._read_sample(current_dataset_idx)
+            except StopIteration as restart_exc:
+                logger.error(
+                    f"[Worker id {self.worker_id}] Dataset {dataset.ds_name} "
+                    "did not yield any data after restart."
+                )
+                self.dataset_weight[current_dataset_idx] = 0.0
+                raise _DatasetExhausted from restart_exc
+        except Exception as exc:  # malformed records are skipped, not exhaustion
+            logger.error(
+                f"[Worker id {self.worker_id}] Failed to parse one item from "
+                f"dataset {dataset.ds_name}: {type(exc).__name__}: {exc}"
+            )
+            return None
 
-                # if len(self.datasets) == 0:
-                if all(weight == 0 for weight in self.dataset_weight):
-                    logger.info(f"[Worker id {self.worker_id}] All Datasets are exhausted, restart them.")
-                    self.dataset_weight = [w for w in self.dataset_weight_orig]
-                    self.dataset_iter_list = [iter(d) for d in self.datasets]
-
-                return None # self.next_data(np.random.choice(len(self.datasets)))
+        if current_sample is None:
+            return None
 
         current_ds_name = self.datasets[current_dataset_idx].ds_name
         
@@ -1043,7 +1090,15 @@ class PackedDataset(IterableDataset):
             assert 'type_ids' in current_sample, 'should have type ids'
             meta_info = current_sample.pop('meta_info', {})
             # 只保留 resume 需要的状态，避免不必要的数据传播
-            needed_keys = {'file_shift', 'bytes_offset', 'line_shift', 'success_cnt', 'fail_cnt'}
+            needed_keys = {
+                'file_shift',
+                'bytes_offset',
+                'line_shift',
+                'success_cnt',
+                'fail_cnt',
+                'epoch',
+                'epoch_position',
+            }
             filtered_meta = {k: v for k, v in meta_info.items() if k in needed_keys}
             self._state_dict[current_ds_name][self.worker_state_key].update(**filtered_meta)
             self._state_dict['sample_info'][self.datasets[current_dataset_idx].ds_name] += 1
@@ -1337,7 +1392,13 @@ class PackedDataset(IterableDataset):
         worker_id = num_workers * self.data_rank + worker_id
         num_workers = num_workers * self.data_world_size
 
-        rng = np.random.default_rng(seed=worker_id)
+        self.worker_id = worker_id
+        self.worker_state_key = f"work_state_{worker_id}"
+
+        # Dataset selection is deterministic for a worker within an epoch and
+        # changes on every epoch.  The child dataset permutation itself is
+        # shared by all workers and sharded without overlap.
+        rng = np.random.default_rng(seed=self.seed + self.epoch + worker_id)
 
         # restore rng state if provided
         yeild_success = True
@@ -1370,10 +1431,6 @@ class PackedDataset(IterableDataset):
                 "iter_idx": iter_idx,
             }
 
-        # reset states of each dataset
-        self.worker_id = worker_id
-        self.worker_state_key = f"work_state_{self.worker_id}"
-
         # resume subdataset 
         if self.resume_state_dict is not None and len(self.resume_state_dict)>0:
             logger.info(f"resume sub-dataset states")
@@ -1391,7 +1448,35 @@ class PackedDataset(IterableDataset):
 
         self.datasets = [d for d in self.datasets_orig]
         self.dataset_weight = [w for w in self.dataset_weight_orig]
+        for dataset in self.datasets:
+            if hasattr(dataset, "dataset_replacement"):
+                dataset.dataset_replacement = self.replacement
+            set_epoch = getattr(dataset, "set_epoch", None)
+            if callable(set_epoch) and getattr(dataset, "epoch", None) != self.epoch:
+                set_epoch(self.epoch)
         self.dataset_iter_list = [iter(d) for d in self.datasets]
+
+        # When child lengths are known, sample datasets in proportion to the
+        # number of records still available.  This is a true uniform
+        # permutation across multiple sources (and reduces to the original
+        # single-source behavior for the 8B job).  Streaming children without
+        # ``__len__`` retain their configured source weights.
+        self._initial_remaining_counts = []
+        for dataset in self.datasets:
+            try:
+                dataset_length = max(int(len(dataset)), 0)
+            except (TypeError, AttributeError, NotImplementedError):
+                dataset_length = None
+            if dataset_length is None:
+                self._initial_remaining_counts.append(None)
+            else:
+                self._initial_remaining_counts.append(
+                    max(
+                        (dataset_length - worker_id + num_workers - 1) // num_workers,
+                        0,
+                    )
+                )
+        self._remaining_counts = list(self._initial_remaining_counts)
 
         for ds in self.datasets:
             if not isinstance(ds, (ImageTextPairDataset, InterleavedDataset)):
@@ -1422,43 +1507,46 @@ class PackedDataset(IterableDataset):
         yield_count = 0
         sync_interval = getattr(self, 'resume_packed_buffer_sync_interval', 100)
 
-        # P2: dynamic weight adjustment based on remaining samples
-        dynamic_weight_interval = 100  # re-compute every N iterations
-        dynamic_weight_counter = 0
         while True:
-            # Periodically adjust dataset_weight by remaining sample ratio
-            dynamic_weight_counter += 1
-            if (dynamic_weight_counter - 1) % dynamic_weight_interval == 0:
-                new_weights = []
-                for ds_idx, ds in enumerate(self.datasets):
-                    orig_w = self.dataset_weight_orig[ds_idx]
-                    if orig_w == 0 or self.dataset_weight[ds_idx] == 0:
-                        new_weights.append(0.0)
-                        continue
-                    consumed = self._state_dict['sample_info'].get(ds.ds_name, 0)
-                    # estimate per-worker total: ds.length spread across all workers
-                    per_worker_total = max(ds.length / num_workers, 1)
-                    remaining_ratio = max(1.0 - consumed / per_worker_total, 0.0)
-                    new_weights.append(orig_w * remaining_ratio)
-                weight_sum = sum(new_weights)
-                if weight_sum > 0:
-                    self.dataset_weight = new_weights
+            sampling_weight = self._get_sampling_weights()
+            weight_sum = sum(sampling_weight)
+            if weight_sum <= 0:
+                if self.replacement:
+                    self.dataset_weight = list(self.dataset_weight_orig)
+                    self._remaining_counts = list(self._initial_remaining_counts)
+                    self.dataset_iter_list = [iter(dataset) for dataset in self.datasets]
+                    continue
+
+                dropped_buffers = len(buffer_list) + len(buffer_max_len_list)
+                if dropped_buffers and self._should_log():
+                    logger.info(
+                        f"Epoch {self.epoch} is exhausted; dropping "
+                        f"{dropped_buffers} incomplete packed buffers."
+                    )
+                return
 
             if self.nlp_mm_sampling_fixed_token and not yeild_success:
                 # will not sample the first nlp dataset 
-                sampling_weight =  [0.0] + self.dataset_weight[1:]
-                sampling_weight = [w/sum(sampling_weight) for w in sampling_weight]
+                restricted_weight = [0.0] + sampling_weight[1:]
+                sampling_weight_sum = sum(restricted_weight)
+                if sampling_weight_sum <= 0:
+                    sampling_weight = [w / weight_sum for w in sampling_weight]
+                else:
+                    sampling_weight = [w/sampling_weight_sum for w in restricted_weight]
                 current_dataset_idx = rng.choice(len(self.dataset_iter_list), p=sampling_weight)
             else:
-                self.dataset_weight = [w / sum(self.dataset_weight) for w in self.dataset_weight]
-
-                current_dataset_idx = rng.choice(len(self.dataset_iter_list), p=self.dataset_weight)
+                sampling_probability = [w / weight_sum for w in sampling_weight]
+                current_dataset_idx = rng.choice(len(self.dataset_iter_list), p=sampling_probability)
                 yeild_success = False
 
-            current_sample = self.next_data(current_dataset_idx)
+            try:
+                current_sample = self.next_data(current_dataset_idx)
+            except _DatasetExhausted:
+                continue
 
             if current_sample is None:
-                # a adataset is over!!
+                # A malformed record is skipped.  It does not reactivate an
+                # exhausted dataset and cannot repeat an already-read record.
                 continue
 
             if current_sample.get('already_packed', False):

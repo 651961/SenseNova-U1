@@ -63,6 +63,7 @@ ce_loss_weight = float(os.environ.get('ce_loss_weight', 1.0))
 # -----------------------------------------------------------------------------
 # Data / sequence
 # -----------------------------------------------------------------------------
+SEED = int(os.environ.get('SEED', 42))
 num_imgs = int(os.environ['num_imgs'])
 seq_length = int(os.environ['seq_len'])
 SEQ_LEN = seq_length
@@ -180,8 +181,8 @@ if llm_data_config is not None:
 # Checkpoint
 # -----------------------------------------------------------------------------
 SAVE_CKPT_FOLDER = f"local:RUN/{JOB_NAME}"
-CHECKPOINT_EVERY = 2000            # full ckpt save every N train steps
-CHECKPOINT_SNAPSHOT_EVERY = 250    # snapshot ckpt save every N train steps
+CHECKPOINT_EVERY = 5000            # full ckpt save every N train steps
+CHECKPOINT_SNAPSHOT_EVERY = 1000    # snapshot ckpt save every N train steps
 
 ckpt = dict(
     enable_save_ckpt=True,
@@ -225,6 +226,9 @@ data = dict(
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
     num_workers=8,
+    persistent_workers=False,
+    drop_last=True,
+    seed=SEED,
     rampup_batch_size="",
     # vision / multimodal
     conv_style=conv_style,

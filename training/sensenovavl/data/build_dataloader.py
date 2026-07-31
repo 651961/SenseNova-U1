@@ -157,6 +157,7 @@ def get_multimodal_streaming_train_loader_items(data_cfg):   # NOTE:
         max_dynamic_patch=data_cfg.max_dynamic_patch,
         data_augment=getattr(data_cfg, "data_augment", True),
         type_id_offset=len(dataset_types),
+        seed=data_cfg.get("seed", 42),
     )
     dataset_types.extend(mm_dataset_types)
     datasets.extend(mm_paired_datasets + mm_cc_datasets + mm_plain_pair_datasets)
@@ -196,6 +197,7 @@ def get_multimodal_streaming_train_loader_items(data_cfg):   # NOTE:
             allow_deduplicated_ds_name=False,
             nlp_mm_sampling_fixed_token=nlp_mm_sampling_fixed_token,
             packed_buffer_stale_threshold=getattr(data_cfg, "packed_buffer_stale_threshold", 200),
+            seed=data_cfg.get("seed", 42),
         )
         train_sampler = None
         train_collate_fn = partial(
@@ -330,6 +332,8 @@ def get_multimodal_packed_streaming_train_loader_items(data_cfg):
         log_freq=data_cfg.log_freq,
         strict_mode=data_cfg.strict_mode,
         debug_mode=getattr(data_cfg, "debug_mode", False),
+        replacement=getattr(data_cfg, "replacement", True),
+        seed=data_cfg.get("seed", 42),
         packed_buffer_stale_threshold=getattr(data_cfg, "packed_buffer_stale_threshold", 200),
     )
 
@@ -505,6 +509,10 @@ def build_train_loader_with_data_type():
         return train_dl, None
 
     dataloader_kwargs = _build_multimodal_dataloader_kwargs(data_cfg, train_collate_fn)
+    if train_sampler is None:
+        # The finite packed dataset intentionally does not pad or recycle the
+        # final partial micro-batch of an epoch.
+        dataloader_kwargs["drop_last"] = data_cfg.get("drop_last", True)
 
     train_dl = RestartableDataLoader(      # NOTE:
         dataset=train_ds,
