@@ -91,6 +91,7 @@ class FeedForward(nn.Module):
             self.fused_w1_w3 = new_linear(
                 "w13", in_features, hidden_features * 2, bias, device=device, dtype=dtype, is_expert=is_expert
             )
+            self.fused_w1_w3._fused_weight_split_sizes = (hidden_features, hidden_features)
             self.w2 = new_linear(
                 "w2", hidden_features, out_features, bias, device=device, dtype=dtype, is_expert=is_expert
             )
