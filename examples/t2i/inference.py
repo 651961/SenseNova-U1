@@ -22,8 +22,8 @@ from sensenova_u1.utils import (
     vram_mode_to_prefetch_count,
 )
 
-NORM_MEAN = (0.5, 0.5, 0.5)
-NORM_STD = (0.5, 0.5, 0.5)
+NORM_MEAN = (0.5, 0.5, 0.5, 0.5)
+NORM_STD = (0.5, 0.5, 0.5, 0.5)
 
 DEFAULT_SEED = 42
 
@@ -57,16 +57,16 @@ def _warn_if_unsupported(width: int, height: int) -> None:
 
 def _denorm(x: torch.Tensor) -> torch.Tensor:
     """Invert the (img - mean) / std normalization back to [0, 1]."""
-    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 4, 1, 1)
+    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 4, 1, 1)
     return (x * std + mean).clamp(0, 1)
 
 
 def _to_pil(batch: torch.Tensor) -> list[Image.Image]:
-    """Convert a [B, 3, H, W] float tensor in normalized space to a list of PIL images."""
+    """Convert a [B, 4, H, W] float tensor in normalized space to RGBA PIL images."""
     arr = _denorm(batch.float()).permute(0, 2, 3, 1).cpu().numpy()
     arr = (arr * 255.0).round().astype(np.uint8)
-    return [Image.fromarray(a) for a in arr]
+    return [Image.fromarray(a, mode="RGBA") for a in arr]
 
 
 class SenseNovaU1T2I:

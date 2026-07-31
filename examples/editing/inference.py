@@ -25,8 +25,8 @@ from sensenova_u1.utils import (
     vram_mode_to_prefetch_count,
 )
 
-NORM_MEAN = (0.5, 0.5, 0.5)
-NORM_STD = (0.5, 0.5, 0.5)
+NORM_MEAN = (0.5, 0.5, 0.5, 0.5)
+NORM_STD = (0.5, 0.5, 0.5, 0.5)
 
 DEFAULT_SEED = 42
 
@@ -89,15 +89,15 @@ def _print_input_resize_hint(num_images: int, input_max_pixels: int | None, sour
 
 
 def _denorm(x: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 4, 1, 1)
+    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 4, 1, 1)
     return (x * std + mean).clamp(0, 1)
 
 
 def _to_pil(batch: torch.Tensor) -> list[Image.Image]:
     arr = _denorm(batch.float()).permute(0, 2, 3, 1).cpu().numpy()
     arr = (arr * 255.0).round().astype(np.uint8)
-    return [Image.fromarray(a) for a in arr]
+    return [Image.fromarray(a, mode="RGBA") for a in arr]
 
 
 def _load_input_image(

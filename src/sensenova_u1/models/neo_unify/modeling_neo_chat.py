@@ -1,6 +1,8 @@
-from typing import List, Optional, Tuple, Union
+import copy
 import math
 import os
+from typing import List, Optional, Tuple, Union
+
 import torch.utils.checkpoint
 from torch import nn
 import transformers
@@ -177,7 +179,9 @@ class NEOChatModel(PreTrainedModel):
             self.vision_model = vision_model
         else:
             self.vision_model = NEOVisionModel(config.vision_config)
-            vision_model_mot_gen = NEOVisionModel(config.vision_config)
+        generation_vision_config = copy.deepcopy(config.vision_config)
+        generation_vision_config.num_channels = 4
+        vision_model_mot_gen = NEOVisionModel(generation_vision_config)
         if language_model is not None:
             self.language_model = language_model
         else:
@@ -191,7 +195,7 @@ class NEOChatModel(PreTrainedModel):
                 self.language_model = Qwen3ForCausalLM(config.llm_config)
 
         merge_size = int(1 / self.downsample_ratio)
-        output_dim = 3*(patch_size*merge_size)**2
+        output_dim = 4*(patch_size*merge_size)**2
         llm_hidden_size = self.config.llm_config.hidden_size
         self.use_deep_fm_head = self.config.fm_head_layers > 2
         self.use_pixel_head = self.config.use_pixel_head
@@ -383,33 +387,33 @@ class NEOChatModel(PreTrainedModel):
     
     def patchify(self, images, patch_size, channel_first=False):
         """
-        images: (N, 3, H, W)
-        x: (N, L, patch_size**2 *3)
+        images: (N, 4, H, W)
+        x: (N, L, patch_size**2 *4)
         """
         h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
-        x = images.reshape(shape=(images.shape[0], 3, h, patch_size, w, patch_size))
+        x = images.reshape(shape=(images.shape[0], 4, h, patch_size, w, patch_size))
 
         if channel_first:
             x = torch.einsum('nchpwq->nhwcpq', x)
         else:
             x = torch.einsum('nchpwq->nhwpqc', x)
         
-        x = x.reshape(shape=(images.shape[0], h * w, patch_size**2 * 3))
+        x = x.reshape(shape=(images.shape[0], h * w, patch_size**2 * 4))
         return x
     
     def unpatchify(sle, x, patch_size, h=None, w=None):
         """
-        x: (N, L, patch_size**2 *3)
-        images: (N, 3, H, W)
+        x: (N, L, patch_size**2 *4)
+        images: (N, 4, H, W)
         """
         if h is None or w is None:
             h = w = int(x.shape[1]**.5)
         else:
             h = h // patch_size
             w = w // patch_size        
-        x = x.reshape(shape=(x.shape[0], h, w, patch_size, patch_size, 3))
+        x = x.reshape(shape=(x.shape[0], h, w, patch_size, patch_size, 4))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        images = x.reshape(shape=(x.shape[0], 3, h * patch_size, w * patch_size))
+        images = x.reshape(shape=(x.shape[0], 4, h * patch_size, w * patch_size))
         return images
     
     def _euler_step(self, v_pred, z, t, t_next):
@@ -601,9 +605,9 @@ class NEOChatModel(PreTrainedModel):
                 
             smoothed_img_2d = self.fm_modules['fm_head'](img_2d)
                 
-            smoothed_reshaped = smoothed_img_2d.view(B, 3, token_h, self.patch_size * merge_size, token_w, self.patch_size * merge_size)
+            smoothed_reshaped = smoothed_img_2d.view(B, 4, token_h, self.patch_size * merge_size, token_w, self.patch_size * merge_size)
             smoothed_reshaped = torch.einsum("b c h p w q -> b h w p q c", smoothed_reshaped)
-            out_1d = smoothed_reshaped.contiguous().view(B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3)
+            out_1d = smoothed_reshaped.contiguous().view(B, L, self.patch_size * merge_size * self.patch_size * merge_size * 4)
             x_pred = out_1d
         else:
             if self.use_deep_fm_head:
@@ -838,7 +842,7 @@ class NEOChatModel(PreTrainedModel):
                     if self.noise_scale_mode == 'dynamic_sqrt':
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
-                image_prediction = noise_scale * torch.randn((1, 3, cur_image_size[1], cur_image_size[0]), device=device, dtype=outputs_cond.logits.dtype)
+                image_prediction = noise_scale * torch.randn((1, 4, cur_image_size[1], cur_image_size[0]), device=device, dtype=outputs_cond.logits.dtype)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -948,7 +952,7 @@ class NEOChatModel(PreTrainedModel):
                     gen_grid_hw_und = gt_grid_hw
                 else:
                     pred_img = image_prediction[0].unsqueeze(0).to(torch.bfloat16)
-                    raw_img = pred_img * 0.5 + 0.5
+                    raw_img = pred_img[:, :3] * 0.5 + 0.5
                     img_mean = torch.tensor([0.485, 0.456, 0.406], dtype=raw_img.dtype, device=device).view(1, 3, 1, 1)
                     img_std = torch.tensor([0.229, 0.224, 0.225], dtype=raw_img.dtype, device=device).view(1, 3, 1, 1)
                     und_img = (raw_img - img_mean) / img_std
@@ -1186,7 +1190,7 @@ class NEOChatModel(PreTrainedModel):
                     if self.noise_scale_mode == 'dynamic_sqrt':
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
-                image_prediction = noise_scale * torch.randn((1, 3, image_size[1], image_size[0]), device=device, dtype=outputs_cond.logits.dtype, generator=generator)
+                image_prediction = noise_scale * torch.randn((1, 4, image_size[1], image_size[0]), device=device, dtype=outputs_cond.logits.dtype, generator=generator)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -1289,7 +1293,7 @@ class NEOChatModel(PreTrainedModel):
                 # re-encode the generated image using the und-branch
                 pred_img = image_prediction[0].unsqueeze(0).to(torch.bfloat16)
                 # re-normalize the image
-                raw_img = pred_img * 0.5 + 0.5
+                raw_img = pred_img[:, :3] * 0.5 + 0.5
                 img_mean = torch.tensor([0.485, 0.456, 0.406], dtype=raw_img.dtype, device=device).view(1, 3, 1, 1)
                 img_std = torch.tensor([0.229, 0.224, 0.225], dtype=raw_img.dtype, device=device).view(1, 3, 1, 1)
                 und_img = (raw_img - img_mean) / img_std
@@ -1540,7 +1544,7 @@ class NEOChatModel(PreTrainedModel):
         noise_scale = min(noise_scale, self.noise_scale_max_value)
         generator = torch.Generator(device).manual_seed(seed)
         image_prediction = noise_scale * torch.randn(
-            (batch_size, 3, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator
+            (batch_size, 4, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator
         )
 
         attention_mask_condition = {"full_attention": None}
@@ -1770,7 +1774,7 @@ class NEOChatModel(PreTrainedModel):
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
         generator = torch.Generator(device).manual_seed(seed)
-        image_prediction = noise_scale * torch.randn((batch_size, 3, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator)
+        image_prediction = noise_scale * torch.randn((batch_size, 4, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator)
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_uncondition = {"full_attention": None}

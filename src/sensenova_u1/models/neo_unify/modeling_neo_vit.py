@@ -161,10 +161,10 @@ class NEOVisionEmbeddings(nn.Module):
         
         pixel_values = pixel_values.view(  # 
             -1,
-            3,
+            self.config.num_channels,
             self.patch_size,
             self.patch_size,
-        )   #  [28072, 768] -> [28072, 3, 16, 16]
+        )   # [N, C * patch_size**2] -> [N, C, patch_size, patch_size]
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
         self.cos_cached_x = self.cos_cached_x.to(patch_embeds.device)
         self.sin_cached_x = self.sin_cached_x.to(patch_embeds.device)
