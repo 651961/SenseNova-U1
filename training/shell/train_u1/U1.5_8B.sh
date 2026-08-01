@@ -20,10 +20,10 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 
 # ============================ Model & data (placeholders — fill in!) ============================ #
 export CONFIG_NAME="configs/sensenovavl_qwen3_gen/sensenovau1_5_8b_mot_pt.py"
-export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/path/to/SenseNova-U1.5-8B-MoT-Preview-Layered"}
-export VOCAB_FILE=${VOCAB_FILE:-"/path/to/qwen3/tokenizer"}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-"/path/to/qwen3/tokenizer"}
-export mm_data_path=${mm_data_path:-"data/sample/sample_data_meta.json"}
+export MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-"/models/SenseNova-U1.5-8B-MoT-Preview-Layered"}
+export VOCAB_FILE=${VOCAB_FILE:-"/models/SenseNova-U1.5-8B-MoT-Preview-Layered"}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-"/models/SenseNova-U1.5-8B-MoT-Preview-Layered"}
+export mm_data_path=${mm_data_path:-"/datasets/data_zsqiao/RevealLayer-100K/train/metadata_sensenova_max4layers_meta.json"}
 export load_optimizer=${load_optimizer:-"model"}
 
 # resume (uncomment to enable)
@@ -39,34 +39,34 @@ export pp_size=1
 
 # ============================ Optimization ============================ #
 export SEED=42
-export lr=2e-4
-export lr_scheduler_type="constant"
+export lr=2e-5
+export lr_scheduler_type="constant_with_warmup"
 export min_lr_ratio=0.5
 export mlp_lr_scale=1.0
 export weight_decay=0
 export grad_accm=1
 export total_steps=200000
-export init_steps=2000
+export init_steps=20
 
 # ============================ Data / sequence ============================ #
 export num_imgs=144
-export seq_len=8192
-export max_sample_tokens=8192
-export dataset_replacement=true
+export seq_len=28800
+export max_sample_tokens=28800
+export dataset_replacement=false
 export min_num_frame=1
 export max_num_frame=128
 export dynamic_image_version="native_resolution"
 export CONV_STYLE="sensenovalm2-chat-v3"
 export down_sample_ratio=0.5
-export max_pixels=$((1024 * 1024))
-export min_pixels=$((256 * 256))
-export max_pixels_gen=$((1024 * 1024))
-export min_pixels_gen=$((256 * 256))
+export max_pixels=$((2048 * 2048))
+export min_pixels=$((2048 * 2048))
+export max_pixels_gen=$((2048 * 2048))
+export min_pixels_gen=$((2048 * 2048))
 export LLM_DATA_WEIGHTS=0
 export MM_CC_DATA_WEIGHTS=0
 
 # ============================ Freeze / trainable modules ============================ #
-export mot_random_init=true
+export mot_random_init=false
 export freeze_llm=true
 export freeze_backbone=true
 export unfreeze_mot_gen=true
@@ -84,8 +84,8 @@ export noise_scale_base_image_seq_len=64
 export add_noise_scale_embedding=true
 export noise_scale_max_value=16
 export use_pixel_head=true
-export rgb_weight=${rgb_weight:-1.0}
-export alpha_weight=${alpha_weight:-1.0}
+export rgb_weight=1.0
+export alpha_weight=1.0
 export P_mean=-0.8
 export P_std=0.8
 export cfg_txt_uncond_drop_prob=0.1

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Export an Internevo checkpoint to a self-contained HuggingFace directory.
-# The default weight type is EMA; pass "normal" as the third argument to
-# export model_wp*.pt from the checkpoint root instead.
+# bash export_hf.sh \
+#     training/RUN/sensenovau1_5_8b_pt/100 \
+#     training/RUN/sensenovau1_5_8b_pt/100_hf_normal \
+#     normal
 
 set -euo pipefail
 
