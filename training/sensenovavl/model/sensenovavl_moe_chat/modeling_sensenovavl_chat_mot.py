@@ -1982,10 +1982,10 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 "image_gen_loss": (
                     image_gen_mse_loss * self.image_gen_loss_weight
                 ).detach(),
-                "image_gen_rgb_loss": (
+                "image_gen_layer_rgb_loss": (
                     image_gen_rgb_loss * self.image_gen_loss_weight
                 ).detach(),
-                "image_gen_alpha_loss": (
+                "image_gen_layer_alpha_loss": (
                     image_gen_alpha_loss * self.image_gen_loss_weight
                 ).detach(),
             }

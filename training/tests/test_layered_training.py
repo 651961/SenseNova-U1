@@ -32,14 +32,16 @@ from sensenova_u1.models.neo_unify.modeling_fm_modules import (
 from sensenova_u1.models.neo_unify.modeling_neo_vit import NEOVisionEmbeddings
 
 
-def test_rgba_pixel_head_preserves_pretrained_rgb_branch():
+def test_rgba_pixel_head_combines_outputs_and_preserves_pretrained_rgb():
     for decoder_cls in (TrainingConvDecoder, InferenceConvDecoder):
         rgb_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=3)
         rgba_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=4)
-        incompatible = rgba_decoder.load_state_dict(rgb_decoder.state_dict(), strict=False)
+        incompatible = rgba_decoder.load_state_dict(rgb_decoder.state_dict(), strict=True)
 
-        assert incompatible.missing_keys == ["alpha_conv.weight", "alpha_conv.bias"]
+        assert incompatible.missing_keys == []
         assert incompatible.unexpected_keys == []
+        assert rgba_decoder.conv2.out_channels == 4 * 8**2
+        assert not hasattr(rgba_decoder, "alpha_conv")
 
         inputs = torch.randn(2, 16, 2, 3)
         rgb = rgb_decoder(inputs)
@@ -47,6 +49,52 @@ def test_rgba_pixel_head_preserves_pretrained_rgb_branch():
         assert rgba.shape == (2, 4, 64, 96)
         torch.testing.assert_close(rgba[:, :3], rgb)
         torch.testing.assert_close(rgba[:, 3], torch.zeros_like(rgba[:, 3]))
+
+
+def test_combined_pixel_head_loads_legacy_split_rgba_weights():
+    for decoder_cls in (TrainingConvDecoder, InferenceConvDecoder):
+        rgb_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=3)
+        legacy_state = deepcopy(rgb_decoder.state_dict())
+        alpha_weight = torch.randn(64, 4, 3, 3)
+        alpha_bias = torch.randn(64)
+        legacy_state["alpha_conv.weight"] = alpha_weight
+        legacy_state["alpha_conv.bias"] = alpha_bias
+
+        rgba_decoder = decoder_cls(input_dim=16, hidden_dim=16, output_channels=4)
+        incompatible = rgba_decoder.load_state_dict(legacy_state, strict=True)
+
+        assert incompatible.missing_keys == []
+        assert incompatible.unexpected_keys == []
+        torch.testing.assert_close(
+            rgba_decoder.conv2.weight[:192],
+            rgb_decoder.conv2.weight,
+        )
+        torch.testing.assert_close(
+            rgba_decoder.conv2.bias[:192],
+            rgb_decoder.conv2.bias,
+        )
+        torch.testing.assert_close(rgba_decoder.conv2.weight[192:], alpha_weight)
+        torch.testing.assert_close(rgba_decoder.conv2.bias[192:], alpha_bias)
+
+
+def test_combined_pixel_head_routes_rgb_and_alpha_gradients_to_separate_rows():
+    decoder = TrainingConvDecoder(input_dim=16, hidden_dim=16, output_channels=4)
+    inputs = torch.randn(1, 16, 2, 2)
+
+    decoder(inputs)[:, :3].square().mean().backward()
+    assert decoder.conv2.weight.grad[:192].abs().sum() > 0
+    torch.testing.assert_close(
+        decoder.conv2.weight.grad[192:],
+        torch.zeros_like(decoder.conv2.weight.grad[192:]),
+    )
+
+    decoder.zero_grad(set_to_none=True)
+    decoder(inputs)[:, 3:].sum().backward()
+    torch.testing.assert_close(
+        decoder.conv2.weight.grad[:192],
+        torch.zeros_like(decoder.conv2.weight.grad[:192]),
+    )
+    assert decoder.conv2.weight.grad[192:].abs().sum() > 0
 
 
 def test_split_alpha_embedding_keeps_rgb_checkpoint_shape():

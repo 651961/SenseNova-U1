@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TRAINING_DIR="${SCRIPT_DIR}/training"
-DEFAULT_BASE_MODEL="/models/SenseNova-U1-8B-MoT-Infographic-V3"
+DEFAULT_BASE_MODEL="/models/SenseNova-U1.5-8B-MoT-Preview-Layered"
 
 usage() {
     printf '%s\n' \
