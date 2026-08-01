@@ -43,6 +43,40 @@ from .cfg_cond_drop_utils import *
 logger = get_logger(__file__)
 
 
+def binarize_object_layer_alpha(
+    pixel_values,
+    image_for_gen_flags,
+    layer_indices,
+    threshold=0.5,
+):
+    """Restore binary object-layer alpha after resize/augmentation.
+
+    RGB inputs and generated base layers are intentionally left untouched.
+    Resizing an RGBA object layer with bicubic interpolation creates soft alpha
+    values even when the source PNG is binary, so threshold only generated
+    layers 1..N after all image transforms have run.
+    """
+
+    if len(pixel_values) != len(image_for_gen_flags) or len(pixel_values) != len(
+        layer_indices
+    ):
+        raise ValueError(
+            "Pixel tensors, generation flags, and layer indices must align."
+        )
+    for image_i, (is_image_for_gen, layer_index) in enumerate(
+        zip(image_for_gen_flags, layer_indices)
+    ):
+        if bool(is_image_for_gen) and int(layer_index) > 0:
+            if pixel_values[image_i].shape[0] != 4:
+                raise ValueError(
+                    "Object-layer tensors must be RGBA before alpha binarization."
+                )
+            pixel_values[image_i][3] = (
+                pixel_values[image_i][3] >= threshold
+            ).to(pixel_values[image_i].dtype)
+    return pixel_values
+
+
 def seconds_to_minutes_secondswithdot(seconds):
     minutes = int(seconds // 60)
     secs = seconds % 60
@@ -988,6 +1022,12 @@ class LazySupervisedDataset(Dataset):
             assert sum(num_tiles) == len(
                 pixel_values
             ), f"{sum(num_tiles)=}, {len(pixel_values)=}"
+
+        pixel_values = binarize_object_layer_alpha(
+            pixel_values,
+            image_for_gen_flags,
+            layer_indices,
+        )
         num_patches = len(pixel_values)
 
         if not self.dynamic_image_size:

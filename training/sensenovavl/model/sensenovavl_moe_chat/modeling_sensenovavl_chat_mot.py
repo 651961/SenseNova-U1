@@ -701,7 +701,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             )
 
         if sum(image_for_gen_flags) == 0:
-            return pixel_values, None, None, None, None, None, None
+            return pixel_values, None, None, None, None, None, None, None
 
         if len(pixel_values) != int((grid_hw[:, 0] * grid_hw[:, 1]).sum()):
             raise ValueError("Packed RGBA patches do not match image grid sizes.")
@@ -863,6 +863,20 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         image_gen_pos_ids = torch.cat(image_gen_pos_ids, dim=0).view(-1)
         image_gen_layer_indices = torch.cat(image_gen_layer_indices, dim=0)
 
+        pixels_per_token = (patch_size * merge_size) ** 2
+        image_gen_target_alpha = image_gen_x.view(
+            image_gen_x.shape[0], pixels_per_token, 4
+        )[..., 3]
+        layered_alpha = image_gen_target_alpha[image_gen_layer_indices > 0]
+        if layered_alpha.numel() and not torch.all(
+            (layered_alpha == -1) | (layered_alpha == 1)
+        ):
+            raise ValueError(
+                "Object-layer alpha targets must be binary (0/255 before "
+                "normalization)."
+            )
+        image_gen_foreground_mask = image_gen_target_alpha > 0
+
         image_gen_v = (image_gen_x - image_gen_z) / (
             1 - image_gen_t.view(-1, 1)
         ).clamp_min(self.t_eps)
@@ -874,6 +888,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             image_gen_pos_ids,
             image_gen_noise_scale,
             image_gen_layer_indices,
+            image_gen_foreground_mask,
         )
 
     def build_image_gen_indicators(
@@ -1114,6 +1129,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 image_gen_pos_ids,
                 image_gen_noise_scale,
                 image_gen_layer_indices,
+                image_gen_foreground_mask,
             ) = self.prepare_image_gen_targets(
                 images,
                 image_for_gen_flags[0],
@@ -1191,6 +1207,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     image_gen_t = None
                     image_gen_noise_scale = None
                     image_gen_layer_indices = None
+                    image_gen_foreground_mask = None
                     
                 elif self.pure_llm is False:
                     vit_embeds = vit_embeds.reshape((-1, vit_embeds.shape[-1]))    # NOTE:
@@ -1258,6 +1275,12 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                             image_gen_v = slice_tensor_by_image_lens(image_gen_v, gen_image_seq_lens, kept_gen_image_seq_lens, dim=0)
                             image_gen_layer_indices = slice_tensor_by_image_lens(
                                 image_gen_layer_indices,
+                                gen_image_seq_lens,
+                                kept_gen_image_seq_lens,
+                                dim=0,
+                            )
+                            image_gen_foreground_mask = slice_tensor_by_image_lens(
+                                image_gen_foreground_mask,
                                 gen_image_seq_lens,
                                 kept_gen_image_seq_lens,
                                 dim=0,
@@ -1830,14 +1853,29 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     dtype=torch.long,
                     device=image_gen_error.device,
                 )
+            if image_gen_foreground_mask is None:
+                if real_image_gen_error.shape[0] != 0:
+                    raise ValueError(
+                        "Generated RGBA targets require a foreground mask."
+                    )
+                image_gen_foreground_mask = torch.empty(
+                    real_image_gen_error.shape[:2],
+                    dtype=torch.bool,
+                    device=real_image_gen_error.device,
+                )
             (
-                rgb_mse_per_token,
-                alpha_mse_per_token,
+                base_rgb_mse_per_token,
+                layered_rgb_mse_per_token,
+                alpha_foreground_mse_per_token,
+                alpha_background_mse_per_token,
                 base_layer_mask,
                 layered_mask,
+                foreground_fraction,
+                background_fraction,
             ) = split_layered_mse(
                 real_image_gen_error,
                 image_gen_layer_indices,
+                image_gen_foreground_mask,
             )
 
             image_gen_token_weights = []
@@ -1862,27 +1900,57 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 )
 
             base_weights = image_gen_token_weights * base_layer_mask
-            layered_weights = image_gen_token_weights * layered_mask
+            layered_foreground_weights = (
+                image_gen_token_weights * layered_mask * foreground_fraction
+            )
+            layered_background_weights = (
+                image_gen_token_weights * layered_mask * background_fraction
+            )
             weight_sums = torch.stack(
-                (base_weights.sum(), layered_weights.sum())
+                (
+                    base_weights.sum(),
+                    layered_foreground_weights.sum(),
+                    layered_background_weights.sum(),
+                )
             )
             dist.all_reduce(
                 weight_sums,
                 op=dist.ReduceOp.AVG,
                 group=gpc.get_group(ParallelMode.DATA),
             )
-            base_weight_sum, layered_weight_sum = weight_sums.unbind()
+            (
+                base_weight_sum,
+                layered_foreground_weight_sum,
+                layered_background_weight_sum,
+            ) = weight_sums.unbind()
 
             image_gen_mse_loss = (
-                rgb_mse_per_token.masked_fill(~base_layer_mask, 0) * base_weights
+                base_rgb_mse_per_token.masked_fill(~base_layer_mask, 0)
+                * base_weights
             ).sum() / base_weight_sum.clamp_min(1)
             image_gen_rgb_loss = (
-                rgb_mse_per_token.masked_fill(~layered_mask, 0) * layered_weights
-            ).sum() / layered_weight_sum.clamp_min(1)
+                layered_rgb_mse_per_token.masked_fill(~layered_mask, 0)
+                * layered_foreground_weights
+            ).sum() / layered_foreground_weight_sum.clamp_min(1)
+
+            alpha_foreground_loss = (
+                alpha_foreground_mse_per_token.masked_fill(~layered_mask, 0)
+                * layered_foreground_weights
+            ).sum() / layered_foreground_weight_sum.clamp_min(1)
+            alpha_background_loss = (
+                alpha_background_mse_per_token.masked_fill(~layered_mask, 0)
+                * layered_background_weights
+            ).sum() / layered_background_weight_sum.clamp_min(1)
+            foreground_class_active = (layered_foreground_weight_sum > 0).to(
+                alpha_foreground_loss.dtype
+            )
+            background_class_active = (layered_background_weight_sum > 0).to(
+                alpha_background_loss.dtype
+            )
             image_gen_alpha_loss = (
-                alpha_mse_per_token.masked_fill(~layered_mask, 0)
-                * layered_weights
-            ).sum() / layered_weight_sum.clamp_min(1)
+                alpha_foreground_loss * foreground_class_active
+                + alpha_background_loss * background_class_active
+            ) / (foreground_class_active + background_class_active).clamp_min(1)
 
             image_gen_loss = self.image_gen_loss_weight * (
                 image_gen_mse_loss
@@ -1899,7 +1967,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 type_mask = (image_gen_type_ids == type_id) & base_layer_mask
                 return global_all_reduce_loss(
                     (
-                        rgb_mse_per_token[type_mask].sum()
+                        base_rgb_mse_per_token[type_mask].sum()
                         * self.image_gen_loss_weight
                     ),
                     type_mask.sum(),

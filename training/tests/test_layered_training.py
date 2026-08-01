@@ -5,7 +5,10 @@ import torch
 from PIL import Image
 
 from sensenovavl.data.dataset import build_transform
-from sensenovavl.data.multimodal_dataset import LazySupervisedDataset
+from sensenovavl.data.multimodal_dataset import (
+    LazySupervisedDataset,
+    binarize_object_layer_alpha,
+)
 from sensenovavl.data.dataset_interleaved_iterable import (
     IGNORE_TOKEN_ID,
     PackedDataset,
@@ -98,20 +101,90 @@ def test_split_layered_mse_ignores_base_alpha_and_splits_later_layers():
             [[16.0, 16.0, 16.0, 25.0], [16.0, 16.0, 16.0, 25.0]],
         ]
     )
-    rgb_mse, alpha_mse, base_mask, layered_mask = split_layered_mse(
-        squared_error, torch.tensor([0, 1, 2])
+    foreground_mask = torch.tensor(
+        [[True, True], [True, False], [False, False]]
+    )
+    (
+        base_rgb_mse,
+        layered_rgb_mse,
+        alpha_foreground_mse,
+        alpha_background_mse,
+        base_mask,
+        layered_mask,
+        foreground_fraction,
+        background_fraction,
+    ) = split_layered_mse(
+        squared_error,
+        torch.tensor([0, 1, 2]),
+        foreground_mask,
     )
 
-    torch.testing.assert_close(rgb_mse, torch.tensor([1.0, 4.0, 16.0]))
-    torch.testing.assert_close(alpha_mse, torch.tensor([100.0, 9.0, 25.0]))
+    torch.testing.assert_close(base_rgb_mse, torch.tensor([1.0, 4.0, 16.0]))
+    torch.testing.assert_close(layered_rgb_mse, torch.tensor([1.0, 4.0, 0.0]))
+    torch.testing.assert_close(
+        alpha_foreground_mse, torch.tensor([100.0, 9.0, 0.0])
+    )
+    torch.testing.assert_close(
+        alpha_background_mse, torch.tensor([0.0, 9.0, 25.0])
+    )
+    torch.testing.assert_close(
+        foreground_fraction, torch.tensor([1.0, 0.5, 0.0])
+    )
+    torch.testing.assert_close(
+        background_fraction, torch.tensor([0.0, 0.5, 1.0])
+    )
     torch.testing.assert_close(base_mask, torch.tensor([True, False, False]))
     torch.testing.assert_close(layered_mask, torch.tensor([False, True, True]))
 
-    default_mse = rgb_mse[base_mask].mean()
-    rgb_loss = rgb_mse[layered_mask].mean()
-    alpha_loss = alpha_mse[layered_mask].mean()
-    total = default_mse + 2 * rgb_loss + 3 * alpha_loss
-    torch.testing.assert_close(total, torch.tensor(72.0))
+
+def test_layered_rgb_mse_has_no_gradient_in_transparent_pixels():
+    prediction = torch.tensor(
+        [
+            [[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]],
+            [[3.0, 3.0, 3.0, 3.0], [4.0, 4.0, 4.0, 4.0]],
+        ],
+        requires_grad=True,
+    )
+    squared_error = prediction.square()
+    foreground_mask = torch.tensor([[True, True], [True, False]])
+    (
+        base_rgb_mse,
+        layered_rgb_mse,
+        alpha_foreground_mse,
+        alpha_background_mse,
+        base_mask,
+        layered_mask,
+        foreground_fraction,
+        background_fraction,
+    ) = split_layered_mse(
+        squared_error,
+        torch.tensor([0, 1]),
+        foreground_mask,
+    )
+
+    base_loss = base_rgb_mse[base_mask].mean()
+    rgb_loss = (
+        layered_rgb_mse[layered_mask] * foreground_fraction[layered_mask]
+    ).sum() / foreground_fraction[layered_mask].sum()
+    alpha_loss = 0.5 * (
+        (
+            alpha_foreground_mse[layered_mask]
+            * foreground_fraction[layered_mask]
+        ).sum()
+        / foreground_fraction[layered_mask].sum()
+        + (
+            alpha_background_mse[layered_mask]
+            * background_fraction[layered_mask]
+        ).sum()
+        / background_fraction[layered_mask].sum()
+    )
+    (base_loss + rgb_loss + alpha_loss).backward()
+
+    torch.testing.assert_close(
+        prediction.grad[1, 1, :3], torch.zeros(3)
+    )
+    assert prediction.grad[1, 0, :3].abs().sum() > 0
+    assert prediction.grad[1, :, 3].abs().sum() > 0
 
 
 def test_rgba_transform_preserves_alpha_and_adds_opaque_alpha_to_rgb():
@@ -129,6 +202,29 @@ def test_rgba_transform_preserves_alpha_and_adds_opaque_alpha_to_rgb():
 
     rgb_tensor = transform(Image.new("RGB", (2, 2), (10, 20, 30)))
     torch.testing.assert_close(rgb_tensor[3], torch.ones((2, 2)))
+
+
+def test_object_layer_alpha_is_binarized_after_image_transforms():
+    pixel_values = [
+        torch.zeros(4, 1, 3),
+        torch.zeros(4, 1, 3),
+        torch.zeros(4, 1, 3),
+    ]
+    pixel_values[0][3] = torch.tensor([[0.2, 0.5, 0.8]])
+    pixel_values[1][3] = torch.tensor([[1.0, 1.0, 1.0]])
+    pixel_values[2][3] = torch.tensor([[0.2, 0.5, 0.8]])
+
+    result = binarize_object_layer_alpha(
+        pixel_values,
+        image_for_gen_flags=[False, True, True],
+        layer_indices=[-1, 0, 1],
+    )
+
+    # Conditioning images and the opaque base layer remain untouched.
+    torch.testing.assert_close(result[0][3], torch.tensor([[0.2, 0.5, 0.8]]))
+    torch.testing.assert_close(result[1][3], torch.ones(1, 3))
+    # Only generated object layers are thresholded.
+    torch.testing.assert_close(result[2][3], torch.tensor([[0.0, 1.0, 1.0]]))
 
 
 def test_standard_and_layered_samples_receive_default_layer_metadata():
@@ -341,8 +437,8 @@ def test_target_builder_shares_timestep_and_fixes_base_alpha():
         [
             [0.0, 0.0, 0.0, 1.0],
             [0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 0.25],
-            [0.0, 0.0, 0.0, 0.75],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
         ]
     )
     outputs = model.prepare_image_gen_targets(
@@ -352,9 +448,21 @@ def test_target_builder_shares_timestep_and_fixes_base_alpha():
         layer_group_ids=torch.tensor([0, 0]),
         layer_indices=torch.tensor([0, 1]),
     )
-    _, image_gen_z, image_gen_v, image_gen_t, _, _, token_layers = outputs
+    (
+        _,
+        image_gen_z,
+        image_gen_v,
+        image_gen_t,
+        _,
+        _,
+        token_layers,
+        foreground_mask,
+    ) = outputs
 
     torch.testing.assert_close(image_gen_t, torch.full((4,), 0.5))
     torch.testing.assert_close(token_layers, torch.tensor([0, 0, 1, 1]))
+    torch.testing.assert_close(
+        foreground_mask, torch.tensor([[True], [True], [False], [True]])
+    )
     torch.testing.assert_close(image_gen_z[:2, 3], torch.ones(2))
     torch.testing.assert_close(image_gen_v[:2, 3], torch.zeros(2))

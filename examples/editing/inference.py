@@ -107,6 +107,7 @@ def _to_pil(batch: torch.Tensor) -> list[list[Image.Image]]:
     arr = (arr * 255.0).round().astype(np.uint8).reshape(
         batch_size, num_layers, height, width, 4
     )
+    arr[..., 3] = np.where(arr[..., 3] >= 128, 255, 0).astype(np.uint8)
     # Keep the serialized contract even if a future sampler violates its invariant.
     arr[:, 0, :, :, 3] = 255
     return [
