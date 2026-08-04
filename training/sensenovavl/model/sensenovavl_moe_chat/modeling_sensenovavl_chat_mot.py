@@ -23,7 +23,6 @@ from sensenovalm.utils.logger import get_logger
 from sensenovalm.utils.parallel import is_using_isp
 from sensenovavl.utils.utils import build_abs_positions_from_grid_hw
 from sensenovavl.model.modules.fm_modules import ConvDecoder, TimestepEmbedder
-from sensenovavl.model.layered_mse_loss import split_layered_mse
 
 from .configuration_sensenovavl_chat import SenseNovaVLChatConfig
 from .modeling_neo_vit import NEOVisionModel
@@ -519,8 +518,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         # name so it does not collide with Hugging Face tensor parallel state.
         self.tp_world_size = gpc.get_world_size(ParallelMode.TENSOR)
         self.image_gen_loss_weight = config.image_gen_loss_weight
-        self.rgb_weight = config.rgb_weight
-        self.alpha_weight = config.alpha_weight
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
         self.enable_vit_sp = gpc.config.parallel.tensor.enable_vit
@@ -701,7 +698,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             )
 
         if sum(image_for_gen_flags) == 0:
-            return pixel_values, None, None, None, None, None, None, None
+            return pixel_values, None, None, None, None, None
 
         if len(pixel_values) != int((grid_hw[:, 0] * grid_hw[:, 1]).sum()):
             raise ValueError("Packed RGBA patches do not match image grid sizes.")
@@ -719,7 +716,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         image_gen_t = []
         image_gen_pos_ids = []
         image_gen_noise_scale = []
-        image_gen_layer_indices = []
         pixel_values_updated = []
 
         und_mean = torch.tensor(
@@ -744,18 +740,11 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             ]
 
             if image_for_gen_flags[image_i]:
-                layer_index = int(layer_indices[image_i])
-                fixed_alpha = layer_index == 0
                 cur_rgba = image_slice.clone().view(
                     -1, 4, patch_size, patch_size
                 )
                 rgb = (cur_rgba[:, :3] * und_std + und_mean).clamp(0, 1)
-                alpha = cur_rgba[:, 3:4].clamp(0, 1)
-                if fixed_alpha and not torch.all(alpha == 1):
-                    raise ValueError(
-                        f"Layer 0 must be fully opaque; image {image_i} contains "
-                        "alpha values below 1."
-                    )
+                alpha = cur_rgba[:, 3:4]
                 cur_pixel_values = (
                     torch.cat((rgb, alpha), dim=1).view(-1, expected_width) - 0.5
                 ) * 2
@@ -769,8 +758,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     )
 
                 cur_noise = torch.randn_like(cur_pixel_values) * noise_scale
-                if fixed_alpha:
-                    cur_noise.view(-1, 4, patch_size, patch_size)[:, 3].fill_(1)
 
                 group_id = int(layer_group_ids[image_i])
                 is_new_group = group_id not in group_timesteps
@@ -842,13 +829,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                         merge_size,
                     )
                 )
-                image_gen_layer_indices.append(
-                    torch.full_like(
-                        t_expanded_merged,
-                        layer_index,
-                        dtype=torch.long,
-                    )
-                )
                 image_gen_pos_ids.append(self.get_per_image_pos_ids(grid_hw[image_i]))
             else:
                 pixel_values_updated.append(image_slice)
@@ -861,21 +841,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         image_gen_t = torch.cat(image_gen_t, dim=0).view(-1)
         image_gen_noise_scale = torch.cat(image_gen_noise_scale, dim=0).view(-1)
         image_gen_pos_ids = torch.cat(image_gen_pos_ids, dim=0).view(-1)
-        image_gen_layer_indices = torch.cat(image_gen_layer_indices, dim=0)
-
-        pixels_per_token = (patch_size * merge_size) ** 2
-        image_gen_target_alpha = image_gen_x.view(
-            image_gen_x.shape[0], pixels_per_token, 4
-        )[..., 3]
-        layered_alpha = image_gen_target_alpha[image_gen_layer_indices > 0]
-        if layered_alpha.numel() and not torch.all(
-            (layered_alpha == -1) | (layered_alpha == 1)
-        ):
-            raise ValueError(
-                "Object-layer alpha targets must be binary (0/255 before "
-                "normalization)."
-            )
-        image_gen_foreground_mask = image_gen_target_alpha > 0
 
         image_gen_v = (image_gen_x - image_gen_z) / (
             1 - image_gen_t.view(-1, 1)
@@ -887,8 +852,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             image_gen_t,
             image_gen_pos_ids,
             image_gen_noise_scale,
-            image_gen_layer_indices,
-            image_gen_foreground_mask,
         )
 
     def build_image_gen_indicators(
@@ -1128,8 +1091,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 image_gen_t,
                 image_gen_pos_ids,
                 image_gen_noise_scale,
-                image_gen_layer_indices,
-                image_gen_foreground_mask,
             ) = self.prepare_image_gen_targets(
                 images,
                 image_for_gen_flags[0],
@@ -1206,8 +1167,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     layer_index_indicators = torch.zeros_like(modality_indicators)
                     image_gen_t = None
                     image_gen_noise_scale = None
-                    image_gen_layer_indices = None
-                    image_gen_foreground_mask = None
                     
                 elif self.pure_llm is False:
                     vit_embeds = vit_embeds.reshape((-1, vit_embeds.shape[-1]))    # NOTE:
@@ -1273,18 +1232,6 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                         if image_gen_z is not None:
                             image_gen_z = slice_tensor_by_image_lens(image_gen_z, gen_image_seq_lens, kept_gen_image_seq_lens, dim=0)
                             image_gen_v = slice_tensor_by_image_lens(image_gen_v, gen_image_seq_lens, kept_gen_image_seq_lens, dim=0)
-                            image_gen_layer_indices = slice_tensor_by_image_lens(
-                                image_gen_layer_indices,
-                                gen_image_seq_lens,
-                                kept_gen_image_seq_lens,
-                                dim=0,
-                            )
-                            image_gen_foreground_mask = slice_tensor_by_image_lens(
-                                image_gen_foreground_mask,
-                                gen_image_seq_lens,
-                                kept_gen_image_seq_lens,
-                                dim=0,
-                            )
                             image_gen_t = slice_tensor_by_image_lens(image_gen_t, gen_image_seq_lens, kept_gen_image_seq_lens, dim=0)
                             image_gen_noise_scale = slice_tensor_by_image_lens(
                                 image_gen_noise_scale, gen_image_seq_lens, kept_gen_image_seq_lens, dim=0
@@ -1839,156 +1786,77 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 image_gen_pred_x = self.fm_modules['fm_head'](image_gen_hidden_states)
 
             # calculate v loss
-            image_gen_pred_v = (image_gen_pred_x - image_gen_z) / (1 - image_gen_t.view(-1, 1)).clamp_min(self.t_eps)
-            image_gen_error = F.mse_loss(
+            image_gen_pred_v = (
+                image_gen_pred_x - image_gen_z
+            ) / (1 - image_gen_t.view(-1, 1)).clamp_min(self.t_eps)
+            image_gen_loss = F.mse_loss(
                 image_gen_pred_v,
                 image_gen_v,
                 reduction="none",
-            ).view(image_gen_pred_v.shape[0], -1, 4)
-            dummy_token_count = pad_dummy_image_num if pad_dummy_image_gen else 0
-            real_image_gen_error = image_gen_error[dummy_token_count:]
-            if image_gen_layer_indices is None:
-                image_gen_layer_indices = torch.empty(
-                    0,
-                    dtype=torch.long,
-                    device=image_gen_error.device,
-                )
-            if image_gen_foreground_mask is None:
-                if real_image_gen_error.shape[0] != 0:
-                    raise ValueError(
-                        "Generated RGBA targets require a foreground mask."
-                    )
-                image_gen_foreground_mask = torch.empty(
-                    real_image_gen_error.shape[:2],
-                    dtype=torch.bool,
-                    device=real_image_gen_error.device,
-                )
-            (
-                base_rgb_mse_per_token,
-                layered_rgb_mse_per_token,
-                alpha_foreground_mse_per_token,
-                alpha_background_mse_per_token,
-                base_layer_mask,
-                layered_mask,
-                foreground_fraction,
-                background_fraction,
-            ) = split_layered_mse(
-                real_image_gen_error,
-                image_gen_layer_indices,
-                image_gen_foreground_mask,
+            ) * self.image_gen_loss_weight
+            if pad_dummy_image_gen:
+                image_gen_loss[:pad_dummy_image_num] *= 0
+            else:
+                pad_dummy_image_num = 0
+            image_gen_loss = image_gen_loss.mean(dim=1)
+
+            image_gen_loss_t2i_indicators = image_gen_type_ids == 3
+            image_gen_loss_t2i = global_all_reduce_loss(
+                image_gen_loss[pad_dummy_image_num:][
+                    image_gen_loss_t2i_indicators
+                ].sum(),
+                image_gen_loss_t2i_indicators.sum(),
             )
 
-            image_gen_token_weights = []
+            image_gen_loss_editing_indicators = image_gen_type_ids == 4
+            image_gen_loss_editing = global_all_reduce_loss(
+                image_gen_loss[pad_dummy_image_num:][
+                    image_gen_loss_editing_indicators
+                ].sum(),
+                image_gen_loss_editing_indicators.sum(),
+            )
+
+            image_gen_loss_interleave_indicators = image_gen_type_ids == 5
+            image_gen_loss_interleave = global_all_reduce_loss(
+                image_gen_loss[pad_dummy_image_num:][
+                    image_gen_loss_interleave_indicators
+                ].sum(),
+                image_gen_loss_interleave_indicators.sum(),
+            )
+
+            losses_for_log_only = {
+                "image_gen_loss_t2i": image_gen_loss_t2i,
+                "image_gen_loss_editing": image_gen_loss_editing,
+                "image_gen_loss_interleave": image_gen_loss_interleave,
+            }
+
+            image_gen_loss_weight = []
             for image_i in range(len(image_for_gen_flags[0])):
                 if image_for_gen_flags[0][image_i]:
-                    cur_image_token_num = int(grid_hw[image_i, 0] * grid_hw[image_i, 1])
+                    cur_image_h = grid_hw[image_i, 0]
+                    cur_image_w = grid_hw[image_i, 1]
+                    cur_image_token_num = cur_image_h * cur_image_w
                     merge_size = round(1 / self.downsample_ratio)
                     cur_image_seq_len = cur_image_token_num // (merge_size**2)
-                    image_gen_token_weights.extend(
-                        [1 / math.sqrt(cur_image_seq_len)] * cur_image_seq_len
+                    image_gen_loss_weight.extend(
+                        [1 / cur_image_seq_len**0.5] * cur_image_seq_len
                     )
-            image_gen_token_weights = torch.tensor(
-                image_gen_token_weights,
+            image_gen_loss_weight = torch.tensor(
+                image_gen_loss_weight,
                 dtype=torch.float32,
-                device=image_gen_error.device,
+                device=image_gen_loss.device,
             )
-            if image_gen_token_weights.shape[0] != real_image_gen_error.shape[0]:
-                raise ValueError(
-                    "Image loss weights must align with generated tokens: "
-                    f"weights={image_gen_token_weights.shape[0]}, "
-                    f"tokens={real_image_gen_error.shape[0]}."
-                )
-
-            base_weights = image_gen_token_weights * base_layer_mask
-            layered_foreground_weights = (
-                image_gen_token_weights * layered_mask * foreground_fraction
-            )
-            layered_background_weights = (
-                image_gen_token_weights * layered_mask * background_fraction
-            )
-            weight_sums = torch.stack(
-                (
-                    base_weights.sum(),
-                    layered_foreground_weights.sum(),
-                    layered_background_weights.sum(),
-                )
-            )
+            image_gen_loss[pad_dummy_image_num:] *= image_gen_loss_weight
+            image_gen_loss_weight_sum = image_gen_loss_weight.sum()
             dist.all_reduce(
-                weight_sums,
+                image_gen_loss_weight_sum,
                 op=dist.ReduceOp.AVG,
                 group=gpc.get_group(ParallelMode.DATA),
             )
-            (
-                base_weight_sum,
-                layered_foreground_weight_sum,
-                layered_background_weight_sum,
-            ) = weight_sums.unbind()
-
-            image_gen_mse_loss = (
-                base_rgb_mse_per_token.masked_fill(~base_layer_mask, 0)
-                * base_weights
-            ).sum() / base_weight_sum.clamp_min(1)
-            image_gen_rgb_loss = (
-                layered_rgb_mse_per_token.masked_fill(~layered_mask, 0)
-                * layered_foreground_weights
-            ).sum() / layered_foreground_weight_sum.clamp_min(1)
-
-            alpha_foreground_loss = (
-                alpha_foreground_mse_per_token.masked_fill(~layered_mask, 0)
-                * layered_foreground_weights
-            ).sum() / layered_foreground_weight_sum.clamp_min(1)
-            alpha_background_loss = (
-                alpha_background_mse_per_token.masked_fill(~layered_mask, 0)
-                * layered_background_weights
-            ).sum() / layered_background_weight_sum.clamp_min(1)
-            foreground_class_active = (layered_foreground_weight_sum > 0).to(
-                alpha_foreground_loss.dtype
+            image_gen_loss = (
+                image_gen_loss.sum()
+                / image_gen_loss_weight_sum.clamp_min(1)
             )
-            background_class_active = (layered_background_weight_sum > 0).to(
-                alpha_background_loss.dtype
-            )
-            image_gen_alpha_loss = (
-                alpha_foreground_loss * foreground_class_active
-                + alpha_background_loss * background_class_active
-            ) / (foreground_class_active + background_class_active).clamp_min(1)
-
-            image_gen_loss = self.image_gen_loss_weight * (
-                image_gen_mse_loss
-                + self.rgb_weight * image_gen_rgb_loss
-                + self.alpha_weight * image_gen_alpha_loss
-            )
-            if dummy_token_count:
-                image_gen_loss = (
-                    image_gen_loss
-                    + image_gen_error[:dummy_token_count].sum() * 0
-                )
-
-            def get_base_loss_for_type(type_id):
-                type_mask = (image_gen_type_ids == type_id) & base_layer_mask
-                return global_all_reduce_loss(
-                    (
-                        base_rgb_mse_per_token[type_mask].sum()
-                        * self.image_gen_loss_weight
-                    ),
-                    type_mask.sum(),
-                )
-
-            losses_for_log_only = {
-                "image_gen_loss_t2i": get_base_loss_for_type(3).detach(),
-                "image_gen_loss_editing": get_base_loss_for_type(4).detach(),
-                "image_gen_loss_interleave": get_base_loss_for_type(5).detach(),
-                # Keep the established metric as the base-layer RGB MSE and log
-                # the two new unweighted MSE components independently.
-                "image_gen_loss": (
-                    image_gen_mse_loss * self.image_gen_loss_weight
-                ).detach(),
-                "image_gen_layer_rgb_loss": (
-                    image_gen_rgb_loss * self.image_gen_loss_weight
-                ).detach(),
-                "image_gen_layer_alpha_loss": (
-                    image_gen_alpha_loss * self.image_gen_loss_weight
-                ).detach(),
-            }
 
 
 

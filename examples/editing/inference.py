@@ -95,8 +95,11 @@ def _denorm(x: torch.Tensor) -> torch.Tensor:
     return (x * std + mean).clamp(0, 1)
 
 
-def _to_pil(batch: torch.Tensor) -> list[list[Image.Image]]:
-    """Convert [B, N, 4, H, W] normalized tensors to RGBA layer stacks."""
+def _to_pil(
+    batch: torch.Tensor,
+    alpha_threshold: int | None = None,
+) -> list[list[Image.Image]]:
+    """Convert normalized tensors to RGBA layers, preserving raw alpha by default."""
     if batch.ndim != 5 or batch.shape[1] < 1 or batch.shape[2] != 4:
         raise ValueError(
             f"Expected generated images with shape [B, N, 4, H, W], got {tuple(batch.shape)}."
@@ -107,9 +110,10 @@ def _to_pil(batch: torch.Tensor) -> list[list[Image.Image]]:
     arr = (arr * 255.0).round().astype(np.uint8).reshape(
         batch_size, num_layers, height, width, 4
     )
-    arr[..., 3] = np.where(arr[..., 3] >= 128, 255, 0).astype(np.uint8)
-    # Keep the serialized contract even if a future sampler violates its invariant.
-    arr[:, 0, :, :, 3] = 255
+    if alpha_threshold is not None:
+        arr[..., 3] = np.where(
+            arr[..., 3] >= alpha_threshold, 255, 0
+        ).astype(np.uint8)
     return [
         [Image.fromarray(arr[sample_idx, layer_idx], mode="RGBA") for layer_idx in range(num_layers)]
         for sample_idx in range(batch_size)
@@ -256,6 +260,7 @@ class SenseNovaU1Editing:
         think_mode: bool = False,
         seed: int = 0,
         num_layers: int = 1,
+        alpha_threshold: int | None = None,
     ) -> tuple[list[list[Image.Image]], str]:
         with make_offload_ctx(self.model, self.prefetch_count, self.device) as offloaded:
             output = offloaded.it2i_generate(
@@ -275,8 +280,8 @@ class SenseNovaU1Editing:
                 seed=seed,
             )
         if think_mode:
-            return _to_pil(output[0]), output[1]
-        return _to_pil(output), ""
+            return _to_pil(output[0], alpha_threshold), output[1]
+        return _to_pil(output, alpha_threshold), ""
 
 
 def _save_images(
@@ -451,8 +456,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "Images generated per sample in bottom-to-top order. "
-            "Use 1 (default) for normal editing and >=2 for layered generation; "
-            "layer 0 is always opaque."
+            "Use 1 (default) for normal editing and >=2 for layered generation."
+        ),
+    )
+    p.add_argument(
+        "--alpha_threshold",
+        type=int,
+        default=None,
+        metavar="0..255",
+        help=(
+            "Optional alpha threshold in uint8 space. By default, preserve the "
+            "model's continuous alpha values in the output PNG; when set, save "
+            "binary alpha (values below the threshold become 0, others become 255)."
         ),
     )
     p.add_argument(
@@ -569,6 +584,8 @@ def parse_args() -> argparse.Namespace:
             )
     if args.num_layers < 1:
         p.error("--num_layers must be >= 1.")
+    if args.alpha_threshold is not None and not 0 <= args.alpha_threshold <= 255:
+        p.error("--alpha_threshold must be between 0 and 255.")
     return args
 
 
@@ -643,6 +660,7 @@ def main() -> None:
                 num_layers=args.num_layers,
                 think_mode=args.think,
                 seed=args.seed,
+                alpha_threshold=args.alpha_threshold,
             )
         out_path = Path(args.output)
         _save_images(outputs, out_path)
@@ -712,6 +730,7 @@ def main() -> None:
                 num_layers=num_layers,
                 think_mode=args.think,
                 seed=seed,
+                alpha_threshold=args.alpha_threshold,
             )
         tag = sample.get("type")
         stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"

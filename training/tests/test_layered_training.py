@@ -7,7 +7,6 @@ from PIL import Image
 from sensenovavl.data.dataset import build_transform
 from sensenovavl.data.multimodal_dataset import (
     LazySupervisedDataset,
-    binarize_object_layer_alpha,
 )
 from sensenovavl.data.dataset_interleaved_iterable import (
     IGNORE_TOKEN_ID,
@@ -16,7 +15,6 @@ from sensenovavl.data.dataset_interleaved_iterable import (
     internevo_collate_fn,
     remap_layer_group_ids_for_packed_documents,
 )
-from sensenovavl.model.layered_mse_loss import split_layered_mse
 from sensenovavl.model.modules.fm_modules import ConvDecoder as TrainingConvDecoder
 from sensenovavl.model.sensenovavl_moe_chat.modeling_sensenovavl_chat_mot import (
     SenseNovaVLChatMoTModel,
@@ -141,98 +139,13 @@ def test_split_alpha_embedding_keeps_rgb_checkpoint_shape():
         )
 
 
-def test_split_layered_mse_ignores_base_alpha_and_splits_later_layers():
-    squared_error = torch.tensor(
-        [
-            [[1.0, 1.0, 1.0, 100.0], [1.0, 1.0, 1.0, 100.0]],
-            [[4.0, 4.0, 4.0, 9.0], [4.0, 4.0, 4.0, 9.0]],
-            [[16.0, 16.0, 16.0, 25.0], [16.0, 16.0, 16.0, 25.0]],
-        ]
-    )
-    foreground_mask = torch.tensor(
-        [[True, True], [True, False], [False, False]]
-    )
-    (
-        base_rgb_mse,
-        layered_rgb_mse,
-        alpha_foreground_mse,
-        alpha_background_mse,
-        base_mask,
-        layered_mask,
-        foreground_fraction,
-        background_fraction,
-    ) = split_layered_mse(
-        squared_error,
-        torch.tensor([0, 1, 2]),
-        foreground_mask,
-    )
+def test_plain_rgba_mse_supervises_every_pixel_and_channel():
+    prediction = torch.ones(2, 3, 4, requires_grad=True)
+    target = torch.zeros_like(prediction)
 
-    torch.testing.assert_close(base_rgb_mse, torch.tensor([1.0, 4.0, 16.0]))
-    torch.testing.assert_close(layered_rgb_mse, torch.tensor([1.0, 4.0, 0.0]))
-    torch.testing.assert_close(
-        alpha_foreground_mse, torch.tensor([100.0, 9.0, 0.0])
-    )
-    torch.testing.assert_close(
-        alpha_background_mse, torch.tensor([0.0, 9.0, 25.0])
-    )
-    torch.testing.assert_close(
-        foreground_fraction, torch.tensor([1.0, 0.5, 0.0])
-    )
-    torch.testing.assert_close(
-        background_fraction, torch.tensor([0.0, 0.5, 1.0])
-    )
-    torch.testing.assert_close(base_mask, torch.tensor([True, False, False]))
-    torch.testing.assert_close(layered_mask, torch.tensor([False, True, True]))
+    torch.nn.functional.mse_loss(prediction, target).backward()
 
-
-def test_layered_rgb_mse_has_no_gradient_in_transparent_pixels():
-    prediction = torch.tensor(
-        [
-            [[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]],
-            [[3.0, 3.0, 3.0, 3.0], [4.0, 4.0, 4.0, 4.0]],
-        ],
-        requires_grad=True,
-    )
-    squared_error = prediction.square()
-    foreground_mask = torch.tensor([[True, True], [True, False]])
-    (
-        base_rgb_mse,
-        layered_rgb_mse,
-        alpha_foreground_mse,
-        alpha_background_mse,
-        base_mask,
-        layered_mask,
-        foreground_fraction,
-        background_fraction,
-    ) = split_layered_mse(
-        squared_error,
-        torch.tensor([0, 1]),
-        foreground_mask,
-    )
-
-    base_loss = base_rgb_mse[base_mask].mean()
-    rgb_loss = (
-        layered_rgb_mse[layered_mask] * foreground_fraction[layered_mask]
-    ).sum() / foreground_fraction[layered_mask].sum()
-    alpha_loss = 0.5 * (
-        (
-            alpha_foreground_mse[layered_mask]
-            * foreground_fraction[layered_mask]
-        ).sum()
-        / foreground_fraction[layered_mask].sum()
-        + (
-            alpha_background_mse[layered_mask]
-            * background_fraction[layered_mask]
-        ).sum()
-        / background_fraction[layered_mask].sum()
-    )
-    (base_loss + rgb_loss + alpha_loss).backward()
-
-    torch.testing.assert_close(
-        prediction.grad[1, 1, :3], torch.zeros(3)
-    )
-    assert prediction.grad[1, 0, :3].abs().sum() > 0
-    assert prediction.grad[1, :, 3].abs().sum() > 0
+    assert torch.all(prediction.grad > 0)
 
 
 def test_rgba_transform_preserves_alpha_and_adds_opaque_alpha_to_rgb():
@@ -250,29 +163,6 @@ def test_rgba_transform_preserves_alpha_and_adds_opaque_alpha_to_rgb():
 
     rgb_tensor = transform(Image.new("RGB", (2, 2), (10, 20, 30)))
     torch.testing.assert_close(rgb_tensor[3], torch.ones((2, 2)))
-
-
-def test_object_layer_alpha_is_binarized_after_image_transforms():
-    pixel_values = [
-        torch.zeros(4, 1, 3),
-        torch.zeros(4, 1, 3),
-        torch.zeros(4, 1, 3),
-    ]
-    pixel_values[0][3] = torch.tensor([[0.2, 0.5, 0.8]])
-    pixel_values[1][3] = torch.tensor([[1.0, 1.0, 1.0]])
-    pixel_values[2][3] = torch.tensor([[0.2, 0.5, 0.8]])
-
-    result = binarize_object_layer_alpha(
-        pixel_values,
-        image_for_gen_flags=[False, True, True],
-        layer_indices=[-1, 0, 1],
-    )
-
-    # Conditioning images and the opaque base layer remain untouched.
-    torch.testing.assert_close(result[0][3], torch.tensor([[0.2, 0.5, 0.8]]))
-    torch.testing.assert_close(result[1][3], torch.ones(1, 3))
-    # Only generated object layers are thresholded.
-    torch.testing.assert_close(result[2][3], torch.tensor([[0.0, 1.0, 1.0]]))
 
 
 def test_standard_and_layered_samples_receive_default_layer_metadata():
@@ -463,7 +353,7 @@ def test_packed_layer_positions_match_layered_inference_positions():
     )
 
 
-def test_target_builder_shares_timestep_and_fixes_base_alpha():
+def test_target_builder_shares_timestep_without_fixing_first_alpha(monkeypatch):
     model = SenseNovaVLChatMoTModel.__new__(SenseNovaVLChatMoTModel)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(vision_config=SimpleNamespace(patch_size=1))
@@ -479,6 +369,11 @@ def test_target_builder_shares_timestep_and_fixes_base_alpha():
     model.timestep_shift = 1.0
     model.tp_world_size = 1
     model.t_eps = 0.05
+    monkeypatch.setattr(
+        torch,
+        "randn_like",
+        lambda value: torch.full_like(value, 0.25),
+    )
 
     # RGB is in ImageNet-normalized understanding space; alpha remains [0, 1].
     pixels = torch.tensor(
@@ -503,14 +398,14 @@ def test_target_builder_shares_timestep_and_fixes_base_alpha():
         image_gen_t,
         _,
         _,
-        token_layers,
-        foreground_mask,
     ) = outputs
 
     torch.testing.assert_close(image_gen_t, torch.full((4,), 0.5))
-    torch.testing.assert_close(token_layers, torch.tensor([0, 0, 1, 1]))
     torch.testing.assert_close(
-        foreground_mask, torch.tensor([[True], [True], [False], [True]])
+        image_gen_z[:, 3], torch.tensor([0.625, 0.625, -0.375, 0.625])
     )
-    torch.testing.assert_close(image_gen_z[:2, 3], torch.ones(2))
-    torch.testing.assert_close(image_gen_v[:2, 3], torch.zeros(2))
+    assert torch.all(image_gen_v[:2, 3] != 0)
+    clean_rgba = image_gen_z + (1 - image_gen_t[:, None]) * image_gen_v
+    torch.testing.assert_close(
+        clean_rgba[:, 3], torch.tensor([1.0, 1.0, -1.0, 1.0])
+    )

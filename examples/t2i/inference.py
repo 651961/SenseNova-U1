@@ -75,8 +75,6 @@ def _to_pil(batch: torch.Tensor) -> list[list[Image.Image]]:
         batch_size, num_layers, height, width, 4
     )
     arr[..., 3] = np.where(arr[..., 3] >= 128, 255, 0).astype(np.uint8)
-    # Keep the serialized contract even if a future sampler violates its invariant.
-    arr[:, 0, :, :, 3] = 255
     return [
         [Image.fromarray(arr[sample_idx, layer_idx], mode="RGBA") for layer_idx in range(num_layers)]
         for sample_idx in range(batch_size)
@@ -271,8 +269,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "Images generated per sample in bottom-to-top order. "
-            "Use 1 (default) for normal T2I and >=2 for layered generation; "
-            "layer 0 is always opaque."
+            "Use 1 (default) for normal T2I and >=2 for layered generation."
         ),
     )
     p.add_argument(

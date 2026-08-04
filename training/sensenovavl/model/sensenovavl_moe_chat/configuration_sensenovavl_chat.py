@@ -39,8 +39,6 @@ class SenseNovaVLChatConfig(PretrainedConfig):
         min_dynamic_patch=1,
         max_dynamic_patch=6,
         image_gen_loss_weight=0.0,
-        rgb_weight=1.0,
-        alpha_weight=1.0,
         ps_version="v1",
         timestep_shift=1,
         time_schedule="standard",
@@ -90,8 +88,6 @@ class SenseNovaVLChatConfig(PretrainedConfig):
         self.img_context_token_id = img_context_token_id
         self.img_start_token_id = img_start_token_id
         self.image_gen_loss_weight = image_gen_loss_weight
-        self.rgb_weight = rgb_weight
-        self.alpha_weight = alpha_weight
         self.timestep_shift = timestep_shift
         self.time_schedule = time_schedule
         self.time_shift_type = time_shift_type

@@ -443,35 +443,6 @@ class NEOChatModel(PreTrainedModel):
     def _validate_num_layers(num_layers):
         if isinstance(num_layers, bool) or not isinstance(num_layers, int) or num_layers < 1:
             raise ValueError(f"num_layers must be an integer >= 1, got {num_layers!r}.")
-
-    @staticmethod
-    def _force_first_image_opaque(images):
-        """Project the first generated image onto opaque alpha in normalized space."""
-        if images.ndim == 4 and images.shape[1] == 4:
-            images[:, 3].fill_(1)
-        elif images.ndim == 5 and images.shape[1] >= 1 and images.shape[2] == 4:
-            images[:, 0, 3].fill_(1)
-        else:
-            raise ValueError(
-                "Expected generated images with shape [B, 4, H, W] or "
-                f"[B, N, 4, H, W], got {tuple(images.shape)}."
-            )
-        return images
-
-    def _zero_first_image_alpha_velocity(self, v_pred, num_layers):
-        """Keep the opaque base image out of both sampling and CFG normalization."""
-        self._validate_num_layers(num_layers)
-        if v_pred.ndim != 3 or v_pred.shape[1] % num_layers or v_pred.shape[2] % 4:
-            raise ValueError(
-                f"Invalid layered velocity shape {tuple(v_pred.shape)} for num_layers={num_layers}."
-            )
-        batch_size, image_token_num, patch_width = v_pred.shape
-        per_layer_tokens = image_token_num // num_layers
-        rgba_velocity = v_pred.reshape(
-            batch_size, num_layers, per_layer_tokens, patch_width // 4, 4
-        )
-        rgba_velocity[:, 0, :, :, 3].zero_()
-        return rgba_velocity.reshape_as(v_pred)
     
     def _euler_step(self, v_pred, z, t, t_next):
         z_next = z + (t_next - t) * v_pred
@@ -694,8 +665,7 @@ class NEOChatModel(PreTrainedModel):
                 ).view(B, L, -1)
             
         
-        v_pred = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
-        return self._zero_first_image_alpha_velocity(v_pred, num_layers)
+        return (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
     
     def _build_it2i_inputs(self, tokenizer, query, pixel_values=None, grid_hw=None):
         model_inputs = tokenizer(query, return_tensors="pt")
@@ -917,7 +887,6 @@ class NEOChatModel(PreTrainedModel):
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
                 image_prediction = noise_scale * torch.randn((1, 4, cur_image_size[1], cur_image_size[0]), device=device, dtype=outputs_cond.logits.dtype)
-                self._force_first_image_opaque(image_prediction)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -1011,7 +980,6 @@ class NEOChatModel(PreTrainedModel):
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, cur_image_size[1], cur_image_size[0])
-                    self._force_first_image_opaque(image_prediction)
 
                 generated_images.append(image_prediction)
 
@@ -1267,7 +1235,6 @@ class NEOChatModel(PreTrainedModel):
                         noise_scale = math.sqrt(noise_scale)
                 noise_scale = min(noise_scale, self.noise_scale_max_value)
                 image_prediction = noise_scale * torch.randn((1, 4, image_size[1], image_size[0]), device=device, dtype=outputs_cond.logits.dtype, generator=generator)
-                self._force_first_image_opaque(image_prediction)
 
                 past_key_values_cond_cfg = past_key_values_cond
                 past_key_values_tu_cfg = past_key_values_tu
@@ -1358,7 +1325,6 @@ class NEOChatModel(PreTrainedModel):
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
-                    self._force_first_image_opaque(image_prediction)
 
                 generated_images.append(image_prediction)
 
@@ -1647,7 +1613,6 @@ class NEOChatModel(PreTrainedModel):
             dtype=dtype,
             generator=generator,
         )
-        self._force_first_image_opaque(image_prediction)
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_img_condition = {"full_attention": None}
@@ -1773,7 +1738,6 @@ class NEOChatModel(PreTrainedModel):
                 image_size[1],
                 image_size[0],
             )
-            self._force_first_image_opaque(image_prediction)
 
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_img_condition is not None:
@@ -1915,7 +1879,6 @@ class NEOChatModel(PreTrainedModel):
             dtype=dtype,
             generator=generator,
         )
-        self._force_first_image_opaque(image_prediction)
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_uncondition = {"full_attention": None}
@@ -2006,7 +1969,6 @@ class NEOChatModel(PreTrainedModel):
                 image_size[1],
                 image_size[0],
             )
-            self._force_first_image_opaque(image_prediction)
 
         clear_flash_kv_cache(past_key_values_condition)
         if past_key_values_uncondition is not None:
