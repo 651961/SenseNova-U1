@@ -91,10 +91,19 @@ def sensenovavl_resume_dataloader(train_dl, train_state, ckpt_manager, dataloade
             logger.info(f"rank [{dist.get_rank()}] resume ds state from :{path}...")
 
         ds_state_file = os.path.join(path, "ds_state", f"ds_state_{dist.get_rank()}.pt")
-        local_ds_state = torch.load(ds_state_file, map_location="cpu")
+        # The dataloader resume state is a trusted internal training
+        # checkpoint and may contain non-tensor Python objects.
+        local_ds_state = torch.load(
+            ds_state_file,
+            map_location="cpu",
+            weights_only=False,
+        )
 
         if os.path.exists(os.path.join(path, "ds_state", f"ds_info_{dist.get_rank()}.pt")):
-            local_info = torch.load(os.path.join(path, "ds_state", f"ds_info_{dist.get_rank()}.pt"))
+            local_info = torch.load(
+                os.path.join(path, "ds_state", f"ds_info_{dist.get_rank()}.pt"),
+                weights_only=False,
+            )
             dl_loader_custom_infos.update(local_info)
 
         for ds_name, worker_states in local_ds_state.items():

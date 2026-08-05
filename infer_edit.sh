@@ -40,9 +40,9 @@ cd /datasets/codes_zsqiao/SenseNova-U1
 
 
 python examples/editing/inference.py \
-    --model_path /models/SenseNova-U1.5-8B-MoT-Preview-Layered-step9000 \
+    --model_path /models/SenseNova-U1.5-8B-MoT-Preview-Layered-step2000 \
     --image /datasets/codes_zsqiao/SenseNova-U1/outputs/11111488/full_image_with_bboxes.png \
-    --prompt "把图中红框选中的所有元素分层，并移除红框。" \
+    --prompt "将图中每个红框内的目标元素分离到独立图层，每个元素单独一层，并移除红框。" \
     --num_layers 3 \
     --no-use-edit-pe \
     --input_max_pixels 4194304 \

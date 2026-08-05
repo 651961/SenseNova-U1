@@ -1,6 +1,6 @@
 # bash export_hf.sh \
-#     /datasets/codes_zsqiao/SenseNova-U1/training/RUN/u15_alpha_bce_dice_v1/snapshot/0 \
-#     /models/SenseNova-U1.5-8B-MoT-Preview-Layered-step9000 \
+#     /datasets/codes_zsqiao/SenseNova-U1/training/RUN/sensenovau1_5_8b_pt/snapshot/1 \
+#     /models/SenseNova-U1.5-8B-MoT-Preview-Layered-step2000 \
 #     normal
 
 set -euo pipefail

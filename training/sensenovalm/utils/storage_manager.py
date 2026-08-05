@@ -1159,6 +1159,12 @@ class StorageManager(metaclass=SingletonMeta):
         self.wait()
         meta = self._get_client(path=load_path)
 
+        # Training checkpoints contain optimizer/scheduler/context objects in
+        # addition to tensors (for example ParallelMode enum values).  PyTorch
+        # 2.6+ defaults torch.load to weights_only=True, which cannot restore
+        # these trusted internal checkpoint states.  Keep an explicit opt-out
+        # here while allowing callers to override it if needed.
+        kwargs.setdefault("weights_only", False)
         return meta.client.load(*unpack_nosave_meta(meta), **kwargs)
 
     def delete_obj(self, fp: str):
