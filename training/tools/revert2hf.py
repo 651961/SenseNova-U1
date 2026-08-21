@@ -53,6 +53,14 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 
 
+# ``model_config.pt`` can reference classes from the local training package.
+# Make the converter independent of the caller's current directory (the
+# package lives in ``training/`` and is not necessarily installed).
+_TRAINING_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TRAINING_ROOT not in sys.path:
+    sys.path.insert(0, _TRAINING_ROOT)
+
+
 # Keys whose tensors are replicated (not split) across WP shards.
 NON_SPLIT_KEYS = [
     "fm_modules",
@@ -486,7 +494,16 @@ def copy_extras(extras_from: str, tgt: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def convert(src: str, tgt: str, typ: str, extras_from: str | None = None) -> None:
+def convert(
+    src: str,
+    tgt: str,
+    typ: str,
+    extras_from: str | None = None,
+    weights_src: str | None = None,
+) -> None:
+    # ``src`` owns model_config.pt; ``weights_src`` may point to a parallel
+    # weight tree such as ``<step>/averaged_model`` for EMA export.
+    weights_src = weights_src or src
     os.makedirs(tgt, exist_ok=True)
     mapping = load_mapping(typ)
     t0 = time.time()
@@ -520,7 +537,7 @@ def convert(src: str, tgt: str, typ: str, extras_from: str | None = None) -> Non
     )
 
     print(f"[2/5] Discovering shards ...")
-    wp_files, moe_meta = discover_shards(src, llm_num_layers, first_k_dense_replace)
+    wp_files, moe_meta = discover_shards(weights_src, llm_num_layers, first_k_dense_replace)
     num_wp = len(wp_files)
     print(f"      dense WP shards: {num_wp}")
     moe_layers = []
@@ -544,7 +561,7 @@ def convert(src: str, tgt: str, typ: str, extras_from: str | None = None) -> Non
     shards = []
     for fname in tqdm(wp_files):
         shards.append(
-            torch.load(os.path.join(src, fname), map_location="cpu", mmap=True, weights_only=False)
+            torch.load(os.path.join(weights_src, fname), map_location="cpu", mmap=True, weights_only=False)
         )
     all_keys = list(shards[0].keys())
     print(f"      dense source keys: {len(all_keys)}")
@@ -598,7 +615,7 @@ def convert(src: str, tgt: str, typ: str, extras_from: str | None = None) -> Non
             slice_path = os.path.join(tgt, slice_name)
 
             expert_states = process_moe_layer(
-                src, actual_L,
+                weights_src, actual_L,
                 num_layers=llm_num_layers,
                 ep_size=moe_meta["ep_size"],
                 ewp_size=moe_meta["ewp_size"],
@@ -642,6 +659,10 @@ def parse_args() -> argparse.Namespace:
              "(+ optional model_moe_layer{L}_expert{E}_wp{W}.pt for MoE).",
     )
     parser.add_argument(
+        "--weights-src", default=None,
+        help="Optional folder containing the weight shards; useful for <src>/averaged_model (EMA).",
+    )
+    parser.add_argument(
         "--tgt", required=True,
         help="Output folder. Created if it doesn't exist.",
     )
@@ -658,4 +679,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.src, args.tgt, args.typ, args.extras_from)
+    convert(args.src, args.tgt, args.typ, args.extras_from, args.weights_src)

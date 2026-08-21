@@ -685,9 +685,18 @@ def main() -> None:
                 think_mode=args.think,
                 seed=args.seed,
             )
-        tag = sample.get("type")
-        stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"
-        sample_out = out_dir / stem
+        output_filename = sample.get("output_filename")
+        if output_filename:
+            output_filename = str(output_filename)
+            if Path(output_filename).name != output_filename:
+                raise ValueError(
+                    f"output_filename must be a filename, not a path: {output_filename!r}"
+                )
+            sample_out = out_dir / output_filename
+        else:
+            tag = sample.get("type")
+            stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"
+            sample_out = out_dir / stem
         outputs[0].save(sample_out)
         if think_text:
             think_path = sample_out.with_suffix(".think.txt")

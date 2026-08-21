@@ -432,7 +432,7 @@ class Boto3Client(StorageClient):
             with io.BytesIO() as f:
                 handler.client.download_fileobj(bucket_name, fp, f, Config=handler.config)
                 f.seek(0)
-                states = torch.load(f, **kwargs)
+                states = torch.load(f, weights_only=False, **kwargs)
         except handler.botocore.exceptions.EndpointConnectionError as exc:
             raise RuntimeError(
                 f"Boto3 Network Error: Please Check your Internet Connection in {socket.gethostname()}"
@@ -569,7 +569,7 @@ class VolcClient(StorageClient):
         try:
             object_stream = handler.client.get_object(bucket_name, fp)
             buffer = io.BytesIO(object_stream.read())
-            states = torch.load(buffer, **kwargs)
+            states = torch.load(buffer, weights_only=False, **kwargs)
         except handler.handler.exceptions.TosClientError as exc:
             raise RuntimeError(
                 f"Volc Network Error: fail with client error, message:{exc.message}, cause: {exc.cause}"
@@ -746,7 +746,7 @@ class AliClient(StorageClient):
         try:
             object_stream = handler.client.get_object(fp)
             buffer = io.BytesIO(object_stream.read())
-            states = torch.load(buffer, **kwargs)
+            states = torch.load(buffer, weights_only=False, **kwargs)
         except Exception as e:
             raise e
 
@@ -834,7 +834,7 @@ class LocalClient(StorageClient):
         if load_path.endswith(".safetensors"):
             return load_file(load_path)
         with open(load_path, "rb") as f:
-            states = torch.load(f, **kwargs)
+            states = torch.load(f, weights_only=False, **kwargs)
         return states
 
     @staticmethod

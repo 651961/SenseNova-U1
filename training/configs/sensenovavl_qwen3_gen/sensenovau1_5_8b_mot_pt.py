@@ -504,9 +504,9 @@ monitor = dict(
         light_monitor_address=None,  # light_monitor heartbeat target
         alert_file_path=f"llm_alter/{JOB_NAME}_alert.log",
     ),
-    tensorboard=dict(queue_max_length=10, interval_step=5),
+    tensorboard=dict(queue_max_length=10, interval_step=2),
 )
-tensorboard = dict(queue_max_length=100)
+tensorboard = dict(queue_max_length=20)
 
 cudnn_benchmark = False
 cudnn_deterministic = False
