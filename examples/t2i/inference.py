@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import torch
@@ -26,8 +25,8 @@ from sensenova_u1.utils import (
     vram_mode_to_prefetch_count,
 )
 
-NORM_MEAN = (0.5, 0.5, 0.5)
-NORM_STD = (0.5, 0.5, 0.5)
+NORM_MEAN = (0.5, 0.5, 0.5, 0.5)
+NORM_STD = (0.5, 0.5, 0.5, 0.5)
 
 DEFAULT_SEED = 42
 
@@ -61,16 +60,55 @@ def _warn_if_unsupported(width: int, height: int) -> None:
 
 def _denorm(x: torch.Tensor) -> torch.Tensor:
     """Invert the (img - mean) / std normalization back to [0, 1]."""
-    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    if x.ndim != 4 or x.shape[1] not in (3, 4):
+        raise ValueError(f"Expected [B, C, H, W] with C=3 or C=4, got {tuple(x.shape)}.")
+    channels = x.shape[1]
+    mean = torch.tensor(NORM_MEAN[:channels], device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
+    std = torch.tensor(NORM_STD[:channels], device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
     return (x * std + mean).clamp(0, 1)
 
 
-def _to_pil(batch: torch.Tensor) -> list[Image.Image]:
-    """Convert a [B, 3, H, W] float tensor in normalized space to a list of PIL images."""
-    arr = _denorm(batch.float()).permute(0, 2, 3, 1).cpu().numpy()
+GeneratedImages = list[Image.Image] | list[list[Image.Image]]
+
+
+def _to_pil(batch: torch.Tensor, alpha_threshold: int | None = None) -> GeneratedImages:
+    """Convert a legacy image batch or bottom-to-top RGBA layer stacks to PIL."""
+    if alpha_threshold is not None and not 0 <= alpha_threshold <= 255:
+        raise ValueError(f"alpha_threshold must be between 0 and 255, got {alpha_threshold}.")
+    if batch.ndim == 4:
+        if batch.shape[1] not in (3, 4):
+            raise ValueError(
+                f"Expected generated images with shape [B, 3|4, H, W], got {tuple(batch.shape)}."
+            )
+        flat_batch = batch
+        batch_size, channels, height, width = batch.shape
+        num_layers = 1
+        layered = False
+    elif batch.ndim == 5:
+        batch_size, num_layers, channels, height, width = batch.shape
+        if num_layers < 1 or channels != 4:
+            raise ValueError(
+                f"Expected layered images with shape [B, N, 4, H, W], got {tuple(batch.shape)}."
+            )
+        flat_batch = batch.reshape(batch_size * num_layers, channels, height, width)
+        layered = True
+    else:
+        raise ValueError(
+            "Expected generated images with shape [B, 3|4, H, W] or "
+            f"[B, N, 4, H, W], got {tuple(batch.shape)}."
+        )
+
+    arr = _denorm(flat_batch.float()).permute(0, 2, 3, 1).detach().cpu().numpy()
     arr = (arr * 255.0).round().astype(np.uint8)
-    return [Image.fromarray(a) for a in arr]
+    if channels == 4 and alpha_threshold is not None:
+        arr[..., 3] = np.where(arr[..., 3] >= alpha_threshold, 255, 0).astype(np.uint8)
+    images = [Image.fromarray(item) for item in arr]
+    if not layered:
+        return images
+    return [
+        images[sample_idx * num_layers : (sample_idx + 1) * num_layers]
+        for sample_idx in range(batch_size)
+    ]
 
 
 class SenseNovaU1T2I:
@@ -143,7 +181,11 @@ class SenseNovaU1T2I:
         batch_size: int = 1,
         seed: int = 0,
         think_mode: bool = False,
-    ) -> list[Image.Image]:
+        num_layers: int = 1,
+        alpha_threshold: int | None = None,
+    ) -> GeneratedImages:
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
         with self._offload_ctx() as offloaded:
             out = offloaded.t2i_generate(
                 self.tokenizer,
@@ -155,6 +197,7 @@ class SenseNovaU1T2I:
                 cfg_interval=cfg_interval,
                 num_steps=num_steps,
                 batch_size=batch_size,
+                num_layers=num_layers,
                 seed=seed,
                 think_mode=think_mode,
             )
@@ -164,7 +207,7 @@ class SenseNovaU1T2I:
         else:
             tensor = out
             self._last_think_text = ""
-        return _to_pil(tensor)
+        return _to_pil(tensor, alpha_threshold)
 
 
 def _resolve_size(sample: dict, default_width: int, default_height: int) -> tuple[int, int]:
@@ -178,19 +221,40 @@ def _resolve_size(sample: dict, default_width: int, default_height: int) -> tupl
     return default_width, default_height
 
 
+def _as_layer_stacks(images: GeneratedImages) -> list[list[Image.Image]]:
+    if not images:
+        raise ValueError("Cannot use an empty generated image batch.")
+    first = images[0]
+    if isinstance(first, Image.Image):
+        return [[image] for image in images]  # type: ignore[list-item]
+    stacks = [list(layers) for layers in images]  # type: ignore[arg-type]
+    if any(not layers for layers in stacks):
+        raise ValueError("Cannot use an empty generated layer stack.")
+    return stacks
+
+
 def _save_images(
-    images: Sequence[Image.Image],
+    images: GeneratedImages,
     out_path: Path,
 ) -> None:
+    stacks = _as_layer_stacks(images)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if len(images) == 1:
-        images[0].save(out_path)
+    if len(stacks) == 1 and len(stacks[0]) == 1:
+        stacks[0][0].save(out_path)
         print(f"[saved] {out_path}")
         return
-    for i, img in enumerate(images):
-        p = out_path.with_name(f"{out_path.stem}_{i}{out_path.suffix}")
-        img.save(p)
-        print(f"[saved] {p}")
+
+    for sample_idx, layers in enumerate(stacks):
+        if len(layers) == 1:
+            path = out_path.with_name(f"{out_path.stem}_{sample_idx}{out_path.suffix}")
+            layers[0].save(path)
+            print(f"[saved] {path}")
+            continue
+        sample_suffix = "" if len(stacks) == 1 else f"_sample_{sample_idx:03d}"
+        for layer_idx, image in enumerate(layers):
+            path = out_path.with_name(f"{out_path.stem}{sample_suffix}_layer_{layer_idx:03d}.png")
+            image.save(path)
+            print(f"[saved] {path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,7 +276,8 @@ def parse_args() -> argparse.Namespace:
     src.add_argument(
         "--jsonl",
         help='JSONL file, one sample per line. Required: {"prompt": ...}. '
-        'Optional: {"width": W, "height": H, "seed": S}.',
+        'Optional: {"width": W, "height": H, "seed": S, "num_layers": N, '
+        '"output_filename": str}.',
     )
 
     p.add_argument("--output", default="output.png", help="Output path when using --prompt.")
@@ -255,6 +320,25 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--num_steps", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument(
+        "--num_layers",
+        type=int,
+        default=1,
+        help=(
+            "Images generated per sample in bottom-to-top order. Use 1 "
+            "(default) for normal T2I and >=2 for layered RGBA generation."
+        ),
+    )
+    p.add_argument(
+        "--alpha_threshold",
+        type=int,
+        default=None,
+        metavar="0..255",
+        help=(
+            "Optional alpha threshold for RGBA output. Continuous alpha is preserved "
+            "by default; when set, values below the threshold become 0 and the rest 255."
+        ),
+    )
     p.add_argument(
         "--seed",
         type=int,
@@ -345,7 +429,12 @@ def parse_args() -> argparse.Namespace:
         help="With --think: also print the reasoning block to stdout.",
     )
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.num_layers < 1:
+        p.error("--num_layers must be >= 1.")
+    if args.alpha_threshold is not None and not 0 <= args.alpha_threshold <= 255:
+        p.error("--alpha_threshold must be between 0 and 255.")
+    return args
 
 
 def _build_enhancer(args: argparse.Namespace):
@@ -433,7 +522,7 @@ def main() -> None:
         if args.prompt is not None:
             prompt = _maybe_enhance(enhancer, loop, args.prompt, verbose=args.print_enhance)
             _warn_if_unsupported(args.width, args.height)
-            with profiler.time_generate(args.width, args.height, args.batch_size):
+            with profiler.time_generate(args.width, args.height, args.batch_size * args.num_layers):
                 images = engine.generate(
                     prompt,
                     image_size=(args.width, args.height),
@@ -443,8 +532,10 @@ def main() -> None:
                     cfg_interval=cfg_interval,
                     num_steps=args.num_steps,
                     batch_size=args.batch_size,
+                    num_layers=args.num_layers,
                     seed=args.seed,
                     think_mode=args.think,
+                    alpha_threshold=args.alpha_threshold,
                 )
             _save_images(images, Path(args.output))
             if args.think:
@@ -477,9 +568,12 @@ def main() -> None:
             w, h = _resolve_size(sample, args.width, args.height)
             _warn_if_unsupported(w, h)
             seed_i = int(sample.get("seed", args.seed))
+            num_layers_i = int(sample.get("num_layers", args.num_layers))
+            if num_layers_i < 1:
+                raise SystemExit(f"JSONL sample {i + 1}: num_layers must be >= 1.")
             think_i = bool(sample["think"]) if "think" in sample else args.think
             prompt = _maybe_enhance(enhancer, loop, sample["prompt"], verbose=args.print_enhance)
-            with profiler.time_generate(w, h, 1):
+            with profiler.time_generate(w, h, num_layers_i):
                 images = engine.generate(
                     prompt,
                     image_size=(w, h),
@@ -489,17 +583,27 @@ def main() -> None:
                     cfg_interval=cfg_interval,
                     num_steps=args.num_steps,
                     batch_size=1,
+                    num_layers=num_layers_i,
                     seed=seed_i,
                     think_mode=think_i,
+                    alpha_threshold=args.alpha_threshold,
                 )
-            tag = sample.get("type")
-            stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"
-            images[0].save(out_dir / stem)
+            output_filename = sample.get("output_filename")
+            if output_filename:
+                output_filename = str(output_filename)
+                if Path(output_filename).name != output_filename:
+                    raise ValueError(f"output_filename must be a filename, not a path: {output_filename!r}")
+                sample_out = out_dir / output_filename
+            else:
+                tag = sample.get("type")
+                stem = f"{i + 1:04d}" + (f"_{tag}" if tag else "") + f"_{w}x{h}.png"
+                sample_out = out_dir / stem
+            _save_images(images, sample_out)
             if think_i:
-                think_stem = stem.replace(".png", ".think.txt")
-                (out_dir / think_stem).write_text(engine.last_think_text, encoding="utf-8")
+                think_path = sample_out.with_suffix(".think.txt")
+                think_path.write_text(engine.last_think_text, encoding="utf-8")
                 if args.print_think:
-                    print(f"[think] sample {i + 1} -> {think_stem}")
+                    print(f"[think] sample {i + 1} -> {think_path.name}")
 
         profiler.report()
     finally:

@@ -42,20 +42,158 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class ConvDecoder(nn.Module):
-    """Decode an H/32 token grid into RGB pixels with local spatial mixing."""
+class _CheckpointCompatibleConv2d(nn.Conv2d):
+    """Load RGB pixel-head rows into an RGB/RGBA convolution.
 
-    def __init__(self, input_dim=4096, hidden_dim=1024):
+    Hugging Face's low-memory loader can assign safetensor parameters directly
+    to child modules, bypassing the parent ``ConvDecoder`` state-dict hook.
+    Adapt the legacy RGB/RGBA output-row difference at the child itself so
+    ``from_pretrained`` remains checkpoint compatible.
+    """
+
+    _rgb_rows = 3 * 8**2
+    _rgba_rows = 4 * 8**2
+
+    @classmethod
+    def _adapt_checkpoint_value(cls, value, target):
+        if target is None or value.shape == target.shape:
+            return value
+        if value.ndim != target.ndim or value.ndim == 0 or value.shape[1:] != target.shape[1:]:
+            return value
+        if value.shape[0] == cls._rgb_rows and target.shape[0] == cls._rgba_rows:
+            expanded = value.new_zeros(target.shape)
+            expanded[: cls._rgb_rows].copy_(value)
+            return expanded
+        if value.shape[0] == cls._rgba_rows and target.shape[0] == cls._rgb_rows:
+            return value[: cls._rgb_rows].contiguous()
+        return value
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        for name in ("weight", "bias"):
+            key = f"{prefix}{name}"
+            value = state_dict.get(key)
+            if value is not None:
+                target = getattr(self, name, None)
+                adapted = self._adapt_checkpoint_value(value, target)
+                if adapted is not value:
+                    state_dict[key] = adapted
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
+class ConvDecoder(nn.Module):
+    """Decode an H/32 token grid with one RGB/RGBA output convolution."""
+
+    final_upscale = 8
+    rgb_channels = 3
+
+    def __init__(self, input_dim=4096, hidden_dim=1024, output_channels=3):
         super().__init__()
+        if output_channels not in (3, 4):
+            raise ValueError(
+                f"ConvDecoder supports 3 or 4 output channels, got {output_channels}."
+            )
+        self.output_channels = output_channels
         self.ps1 = nn.PixelShuffle(2)
         self.conv1 = nn.Conv2d(input_dim // 4, hidden_dim, kernel_size=3, padding=1)
         self.act1 = nn.GELU()
 
         self.ps2 = nn.PixelShuffle(2)
-        self.conv2 = nn.Conv2d(hidden_dim // 4, 192, kernel_size=3, padding=1)
+        output_subpixel_channels = output_channels * self.final_upscale**2
+        self.conv2 = _CheckpointCompatibleConv2d(
+            hidden_dim // 4,
+            output_subpixel_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        if output_channels == 4:
+            alpha_start = self.rgb_channels * self.final_upscale**2
+            nn.init.zeros_(self.conv2.weight[alpha_start:])
+            nn.init.zeros_(self.conv2.bias[alpha_start:])
 
-        self.ps3 = nn.PixelShuffle(8)
+        self.ps3 = nn.PixelShuffle(self.final_upscale)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Expand legacy RGB/split-RGBA heads into the combined convolution."""
+
+        weight_key = f"{prefix}conv2.weight"
+        bias_key = f"{prefix}conv2.bias"
+        alpha_weight_key = f"{prefix}alpha_conv.weight"
+        alpha_bias_key = f"{prefix}alpha_conv.bias"
+        rgb_subpixel_channels = self.rgb_channels * self.final_upscale**2
+
+        source_weight = state_dict.get(weight_key)
+        if (
+            self.output_channels == 4
+            and source_weight is not None
+            and source_weight.shape[0] == rgb_subpixel_channels
+        ):
+            expanded_weight = source_weight.new_zeros(self.conv2.weight.shape)
+            expanded_weight[:rgb_subpixel_channels].copy_(source_weight)
+            legacy_alpha_weight = state_dict.pop(alpha_weight_key, None)
+            if legacy_alpha_weight is not None:
+                if legacy_alpha_weight.shape != expanded_weight[rgb_subpixel_channels:].shape:
+                    error_msgs.append(
+                        f"size mismatch for {alpha_weight_key}: expected "
+                        f"{tuple(expanded_weight[rgb_subpixel_channels:].shape)}, got "
+                        f"{tuple(legacy_alpha_weight.shape)}"
+                    )
+                else:
+                    expanded_weight[rgb_subpixel_channels:].copy_(legacy_alpha_weight)
+            state_dict[weight_key] = expanded_weight
+
+            source_bias = state_dict.get(bias_key)
+            if source_bias is not None and source_bias.shape[0] == rgb_subpixel_channels:
+                expanded_bias = source_bias.new_zeros(self.conv2.bias.shape)
+                expanded_bias[:rgb_subpixel_channels].copy_(source_bias)
+                legacy_alpha_bias = state_dict.pop(alpha_bias_key, None)
+                if legacy_alpha_bias is not None:
+                    if legacy_alpha_bias.shape != expanded_bias[rgb_subpixel_channels:].shape:
+                        error_msgs.append(
+                            f"size mismatch for {alpha_bias_key}: expected "
+                            f"{tuple(expanded_bias[rgb_subpixel_channels:].shape)}, got "
+                            f"{tuple(legacy_alpha_bias.shape)}"
+                        )
+                    else:
+                        expanded_bias[rgb_subpixel_channels:].copy_(legacy_alpha_bias)
+                state_dict[bias_key] = expanded_bias
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x):
         x = self.act1(self.conv1(self.ps1(x)))
-        return self.ps3(self.conv2(self.ps2(x)))
+        x = self.ps2(x)
+        return self.ps3(self.conv2(x))

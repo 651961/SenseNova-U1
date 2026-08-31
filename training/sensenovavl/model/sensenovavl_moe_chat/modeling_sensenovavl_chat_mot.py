@@ -3,6 +3,7 @@
 # Copyright (c) 2023 OpenGVLab. Licensed under MIT.
 # Copyright (c) SenseNovaLM contributors. Modifications licensed under Apache-2.0.
 # --------------------------------------------------------
+import copy
 import warnings
 from typing import List, Optional
 
@@ -137,14 +138,68 @@ def dense_from_flex_mask(mask_fn, slen, device="cuda"):
 
     return M.bool()
 
-def create_flex_mask_padding_image_gen(document_ids, modality_indicators, image_gen_indicators, token_pos, dup_boundary, div_num, compile_mask, mask_image_gen_tokens=False):
+def _same_layer_group_gen(
+    document_ids,
+    image_gen_indicators,
+    layer_group_indicators,
+    q_idx,
+    kv_idx,
+):
+    q_group = layer_group_indicators[q_idx]
+    return (
+        image_gen_indicators[q_idx]
+        & image_gen_indicators[kv_idx]
+        & (q_group >= 0)
+        & (q_group == layer_group_indicators[kv_idx])
+        & (document_ids[q_idx] == document_ids[kv_idx])
+    )
+
+
+def create_flex_mask_padding_image_gen(
+    document_ids,
+    modality_indicators,
+    image_gen_indicators,
+    token_pos,
+    dup_boundary,
+    div_num,
+    compile_mask,
+    mask_image_gen_tokens=False,
+    layer_group_indicators=None,
+    layer_prefix_positions=None,
+):
+    # Keep the historical positional order intact.  Layer metadata is an
+    # optional tail extension so callers written for the RGB/single-layer
+    # model continue to work unchanged.
+    legacy_layer_metadata = (
+        layer_group_indicators is None and layer_prefix_positions is None
+    )
+    if (layer_group_indicators is None) != (layer_prefix_positions is None):
+        raise ValueError(
+            "layer_group_indicators and layer_prefix_positions must either "
+            "both be provided or both be omitted."
+        )
+
     slen = document_ids.size(-1)
     padlen = calculate_pad_length(seqlen=slen, div_num=div_num)
+    if layer_group_indicators is None:
+        layer_group_indicators = torch.full_like(modality_indicators, -1)
+        layer_prefix_positions = token_pos.clone()
+    else:
+        layer_group_indicators = torch.as_tensor(
+            layer_group_indicators,
+            device=document_ids.device,
+        ).reshape(-1)
+        layer_prefix_positions = torch.as_tensor(
+            layer_prefix_positions,
+            device=document_ids.device,
+        ).reshape(-1)
     if padlen > 0:
         pad_doc_id = document_ids.max() + 1
         document_ids = F.pad(document_ids, (0, padlen), value=pad_doc_id)
         modality_indicators = F.pad(modality_indicators, (0, padlen), value=-1)
         image_gen_indicators = F.pad(image_gen_indicators, (0, padlen), value=False)
+        layer_group_indicators = F.pad(layer_group_indicators, (0, padlen), value=-1)
+        layer_prefix_positions = F.pad(layer_prefix_positions, (0, padlen), value=-1)
         dup_boundary = F.pad(dup_boundary, (0, padlen), value=False)
 
         last = token_pos.max()
@@ -154,6 +209,8 @@ def create_flex_mask_padding_image_gen(document_ids, modality_indicators, image_
     assert document_ids.numel() == padded_len, (document_ids.numel(), padded_len)
     assert modality_indicators.numel() == padded_len, (modality_indicators.numel(), padded_len)
     assert image_gen_indicators.numel() == padded_len, (image_gen_indicators.numel(), padded_len)
+    assert layer_group_indicators.numel() == padded_len, (layer_group_indicators.numel(), padded_len)
+    assert layer_prefix_positions.numel() == padded_len, (layer_prefix_positions.numel(), padded_len)
     assert token_pos.numel() == padded_len, (token_pos.numel(), padded_len)
     assert dup_boundary.numel() == padded_len, (dup_boundary.numel(), padded_len)
 
@@ -169,8 +226,22 @@ def create_flex_mask_padding_image_gen(document_ids, modality_indicators, image_
         same_doc = document_ids[q_idx] == document_ids[kv_idx]
         return is_image & (modality_indicators[q_idx] == modality_indicators[kv_idx]) & same_doc
 
+    def same_layer_group_mask(b, h, q_idx, kv_idx):
+        return _same_layer_group_gen(
+            document_ids,
+            image_gen_indicators,
+            layer_group_indicators,
+            q_idx,
+            kv_idx,
+        )
+
     samedoc_causal_mask = and_masks(causal_mask, samedoc_mask)
-    mask_mod = or_masks(samedoc_causal_mask, sameimg_mask)
+    if legacy_layer_metadata:
+        # Avoid changing the legacy callable graph (some downstream wrappers
+        # provide a two-argument ``or_masks`` shim).
+        mask_mod = or_masks(samedoc_causal_mask, sameimg_mask)
+    else:
+        mask_mod = or_masks(samedoc_causal_mask, sameimg_mask, same_layer_group_mask)
 
     # forbid any token attending to image_gen tokens except same-image image_gen tokens or formids image_gen tokens attending to corresponding duplicated image tokens ---
     def gen_kv_gate_mask(b, h, q_idx, kv_idx):
@@ -179,10 +250,28 @@ def create_flex_mask_padding_image_gen(document_ids, modality_indicators, image_
 
         same_doc = document_ids[q_idx] == document_ids[kv_idx]
         same_img = (modality_indicators[q_idx] == modality_indicators[kv_idx]) & same_doc
+        same_layer_group = _same_layer_group_gen(
+            document_ids,
+            image_gen_indicators,
+            layer_group_indicators,
+            q_idx,
+            kv_idx,
+        )
 
-        gate1 = (~kv_is_gen) | (q_is_gen & same_img)
+        gate1 = (~kv_is_gen) | (q_is_gen & (same_img | same_layer_group))
 
-        gate2 = (~q_is_gen) | kv_is_gen | (token_pos[kv_idx] != token_pos[q_idx])
+        if legacy_layer_metadata:
+            # The legacy mask allowed generated queries to see generated keys
+            # at every *different* timestep.  Retain that exact rule when no
+            # layer metadata is supplied; the prefix-position rule below is
+            # only needed for the layered path.
+            gate2 = (~q_is_gen) | kv_is_gen | (
+                token_pos[kv_idx] != token_pos[q_idx]
+            )
+        else:
+            gate2 = (~q_is_gen) | kv_is_gen | (
+                token_pos[kv_idx] < layer_prefix_positions[q_idx]
+            )
 
         return gate1 & gate2
 
@@ -230,6 +319,44 @@ def build_dup_boundary(modality_indicators, gen_tok, dup_tok):
 def get_image_seq_lens(grid_hw: torch.Tensor, merge_size: int):
     image_seq_lens = (grid_hw[:, 0] * grid_hw[:, 1] // (merge_size**2)).tolist()
     return [int(seq_len) for seq_len in image_seq_lens]
+
+
+def build_modality_indicators(
+    image_context_mask: torch.Tensor,
+    image_seq_lens,
+):
+    flat_context = image_context_mask.reshape(-1).bool()
+    modality_indicators = torch.full(
+        (flat_context.shape[0],),
+        -1,
+        dtype=torch.long,
+        device=flat_context.device,
+    )
+    image_seq_lens = torch.as_tensor(
+        image_seq_lens,
+        dtype=torch.long,
+        device=flat_context.device,
+    )
+    context_positions = torch.nonzero(flat_context, as_tuple=True)[0]
+    expected_context_tokens = int(image_seq_lens.sum().item())
+    if context_positions.numel() != expected_context_tokens:
+        raise RuntimeError(
+            "Image context token count does not match image sequence lengths: "
+            f"tokens={context_positions.numel()}, expected={expected_context_tokens}, "
+            f"image_seq_lens={image_seq_lens.tolist()}."
+        )
+
+    image_ids = torch.repeat_interleave(
+        torch.arange(
+            1,
+            image_seq_lens.numel() + 1,
+            device=flat_context.device,
+            dtype=torch.long,
+        ),
+        image_seq_lens,
+    )
+    modality_indicators[context_positions] = image_ids
+    return modality_indicators
 
 
 def slice_tensor_by_image_lens(tensor: Optional[torch.Tensor], full_image_seq_lens, kept_image_seq_lens, dim: int = 0):
@@ -328,13 +455,53 @@ def pack_two_branch_sequence(
     modality_indicators: torch.Tensor,    # [L] long; -1 for non-img else image_id
     image_gen_indicators: torch.Tensor,   # [1, L] bool or [L] bool
     dup_boundary: torch.Tensor,   # [1, L] bool or [L] bool
+    layer_group_indicators: Optional[torch.Tensor] = None, # [L] long; -1 outside generated layers
+    layer_index_indicators: Optional[torch.Tensor] = None, # [L] long; 0 outside generated layers
 ):
+    # ``dup_boundary`` was historically the sixth positional argument.  Keep
+    # it there and expose layer metadata as optional tail arguments.  The
+    # return tuple follows the same compatibility rule: legacy callers get
+    # the original nine fields, while metadata-aware callers get the two
+    # additional packed indicator tensors.
+    legacy_layer_metadata = (
+        layer_group_indicators is None and layer_index_indicators is None
+    )
+    if (layer_group_indicators is None) != (layer_index_indicators is None):
+        raise ValueError(
+            "layer_group_indicators and layer_index_indicators must either "
+            "both be provided or both be omitted."
+        )
+
     assert hidden_states.ndim == 3 and hidden_states.shape[0] == 1
     L = hidden_states.shape[1]
     assert indexes.shape[0] == L
     assert document_ids.shape[0] == L
     assert modality_indicators.shape[0] == L
     assert dup_boundary.shape[0] == L
+
+    if legacy_layer_metadata:
+        layer_group_indicators = torch.full(
+            (L,),
+            -1,
+            dtype=torch.long,
+            device=indexes.device,
+        )
+        layer_index_indicators = torch.zeros(
+            (L,),
+            dtype=torch.long,
+            device=indexes.device,
+        )
+    else:
+        layer_group_indicators = torch.as_tensor(
+            layer_group_indicators,
+            device=indexes.device,
+        ).reshape(-1)
+        layer_index_indicators = torch.as_tensor(
+            layer_index_indicators,
+            device=indexes.device,
+        ).reshape(-1)
+        assert layer_group_indicators.shape[0] == L
+        assert layer_index_indicators.shape[0] == L
 
     gen = image_gen_indicators
     if gen.ndim == 2:
@@ -354,25 +521,73 @@ def pack_two_branch_sequence(
     inv_perm[perm] = torch.arange(L, device=perm.device, dtype=perm.dtype)
 
     packed_hidden_states = hidden_states[:, perm, :]
-    packed_indexes = indexes[perm]
+    token_pos = indexes[:, 0][perm].clone()
+    packed_indexes = indexes[perm].clone()
     packed_document_ids = document_ids[perm]
     packed_modality_indicators = modality_indicators[perm]
     packed_image_gen_indicators = gen[perm]
+    packed_layer_group_indicators = layer_group_indicators[perm]
+    packed_layer_index_indicators = layer_index_indicators[perm]
     packed_dup_boundary = dup_boundary[perm]
 
-    token_pos = packed_indexes[:, 0].clone()
+    valid_groups = packed_image_gen_indicators & (packed_layer_group_indicators >= 0)
+    if valid_groups.any():
+        doc_group_pairs = torch.unique(
+            torch.stack(
+                [
+                    packed_document_ids[valid_groups].long(),
+                    packed_layer_group_indicators[valid_groups].long(),
+                ],
+                dim=1,
+            ),
+            dim=0,
+        )
+        for doc_id, group_id in doc_group_pairs:
+            group_mask = (
+                valid_groups
+                & (packed_document_ids == doc_id)
+                & (packed_layer_group_indicators == group_id)
+            )
+            if packed_layer_index_indicators[group_mask].max() == 0:
+                continue
+            layer_zero = group_mask & (packed_layer_index_indicators == 0)
+            if not layer_zero.any():
+                raise ValueError(
+                    f"Layer group {int(group_id)} in document {int(doc_id)} has no layer 0."
+                )
+            base_t = token_pos[layer_zero].min()
+            packed_indexes[group_mask, 0] = (
+                base_t
+                + packed_layer_index_indicators[group_mask].to(packed_indexes.dtype)
+            )
 
-    return (
+    packed_result = (
         packed_hidden_states,
         packed_indexes,
         packed_document_ids,
         packed_modality_indicators,
         packed_image_gen_indicators,
+        packed_layer_group_indicators,
+        packed_layer_index_indicators,
         perm,
         inv_perm,
         token_pos,
         packed_dup_boundary
     )
+    if legacy_layer_metadata:
+        # Drop the metadata fields for callers using the historical API.
+        return (
+            packed_result[0],
+            packed_result[1],
+            packed_result[2],
+            packed_result[3],
+            packed_result[4],
+            packed_result[7],
+            packed_result[8],
+            packed_result[9],
+            packed_result[10],
+        )
+    return packed_result
 
 
 def unpack_two_branch_sequence(
@@ -484,6 +699,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         self.P_std = config.P_std
         self.t_eps = config.t_eps
         self.use_pixel_head = config.use_pixel_head
+        self.image_gen_channels = config.output_channels
 
         if first is True and self.pure_llm is False:
             if gpc.is_rank_for_log():
@@ -494,12 +710,17 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             else:
                 self.vision_model = NEOVisionModel(config.vision_config)
 
-            vision_model_mot_gen = NEOVisionModel(config.vision_config)
+            generation_vision_config = copy.deepcopy(config.vision_config)
+            generation_vision_config.num_channels = self.image_gen_channels
+            generation_vision_config.split_alpha_embedding = (
+                self.image_gen_channels == 4
+            )
+            vision_model_mot_gen = NEOVisionModel(generation_vision_config)
             # vision_model_mot_gen.embeddings.add_pos_embedding = False
             # image geneneration related modules
             patch_size = self.config.vision_config.patch_size
             merge_size = int(1 / self.downsample_ratio)
-            output_dim = 3*(patch_size*merge_size)**2
+            output_dim = self.image_gen_channels * (patch_size * merge_size) ** 2
             
             timestep_embedder = TimestepEmbedder(llm_hidden_size)
             fm_head = nn.Sequential(
@@ -517,7 +738,10 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             )
 
             if self.use_pixel_head:
-                self.fm_modules["fm_head"] = ConvDecoder(llm_hidden_size)
+                self.fm_modules["fm_head"] = ConvDecoder(
+                    llm_hidden_size,
+                    output_channels=self.image_gen_channels,
+                )
 
             if self.add_noise_scale_embedding:
                 noise_scale_embedder = TimestepEmbedder(llm_hidden_size)
@@ -586,101 +810,542 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
             raise ValueError(f"Unsupported time_schedule: {self.time_schedule}")
         return 1 - sigma
 
-    def prepare_image_gen_targets(self, pixel_values, image_for_gen_flags, grid_hw):
-        if sum(image_for_gen_flags) == 0:
-            return pixel_values, None, None, None, None, None
+    def _normalize_patch_grid(self, grid_hw, num_images, device):
+        """Normalize an image grid description to ``[num_images, 2]``.
 
-        patch_size = self.config.vision_config.patch_size
-        merge_size = round(1 / self.downsample_ratio) 
-        patch_size_after_downsample = patch_size * merge_size
-        pixel_values = pixel_values.view(-1, 3*self.patch_size*self.patch_size)
+        Native-resolution features already arrive as a sequence of flattened
+        patches and carry ``grid_hw`` separately.  Older/fixed-resolution
+        callers, however, often omit it because the spatial dimensions are
+        available on the ``[N, C, H, W]`` tensor itself.  Keeping this small
+        conversion in one place avoids subtly different validation in the
+        understanding and generation branches.
+        """
 
-        assert len(pixel_values) == (grid_hw[:, 0] * grid_hw[:, 1]).sum()
-        assert len(image_for_gen_flags) == len(grid_hw)
+        if grid_hw is None:
+            return None
+        try:
+            grid = torch.as_tensor(grid_hw, dtype=torch.long, device=device)
+        except (TypeError, ValueError, RuntimeError):
+            if isinstance(grid_hw, (list, tuple)):
+                grid = torch.stack(
+                    [torch.as_tensor(item, dtype=torch.long, device=device) for item in grid_hw]
+                )
+            else:
+                raise
+        # A few legacy callers pass an empty list for the non-native path.
+        if grid.numel() == 0:
+            return None
+        if grid.ndim == 3 and grid.shape[0] == 1:
+            grid = grid[0]
+        if grid.ndim == 1:
+            if grid.numel() == 2 and num_images == 1:
+                grid = grid.view(1, 2)
+            else:
+                raise ValueError(
+                    "image_grid_hw must have shape [num_images, 2], "
+                    f"got {tuple(grid.shape)} for {num_images} images."
+                )
+        if grid.ndim != 2 or grid.shape[-1] != 2 or grid.shape[0] != num_images:
+            raise ValueError(
+                "image_grid_hw must have shape [num_images, 2], "
+                f"got {tuple(grid.shape)} for {num_images} images."
+            )
+        if (grid <= 0).any():
+            raise ValueError(f"image_grid_hw entries must be positive, got {grid.tolist()}.")
+        return grid.contiguous()
 
-        # only include images for generation
+    def _infer_packed_grid(self, num_patches, num_images=1, device=None):
+        """Infer a grid for legacy packed fixed-resolution inputs.
+
+        There is no way to recover an arbitrary rectangular grid from only a
+        flat patch count.  We therefore accept the common square fixed-size
+        case (and the configured ``image_size`` when it matches), while
+        producing a clear error for ambiguous inputs.  Native-resolution
+        callers should continue to pass ``grid_hw`` explicitly.
+        """
+
+        num_patches = int(num_patches)
+        num_images = int(num_images)
+        if num_images <= 0 or num_patches % num_images:
+            raise ValueError(
+                "Cannot infer image grids from packed patches: "
+                f"patches={num_patches}, images={num_images}."
+            )
+        patches_per_image = num_patches // num_images
+        configured_side = None
+        image_size = getattr(self, "image_size", None)
+        if image_size is not None:
+            configured_side = int(image_size) // int(self.patch_size)
+        if configured_side and configured_side * configured_side == patches_per_image:
+            side = configured_side
+        else:
+            side = math.isqrt(patches_per_image)
+            if side * side != patches_per_image:
+                raise ValueError(
+                    "image_grid_hw is required for non-square packed inputs; "
+                    f"cannot infer a grid from {patches_per_image} patches/image."
+                )
+        return torch.full(
+            (num_images, 2),
+            side,
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _canonicalize_image_patches(
+        self,
+        pixel_values,
+        grid_hw=None,
+        num_images=None,
+    ):
+        """Return packed patches and their channel count.
+
+        The training dataloader currently emits ``[N, C, H, W]`` tensors for
+        fixed-resolution images and ``[num_patches, C * P * P]`` tensors for
+        native resolution.  Before the layered change, both forms were RGB;
+        after it they are usually RGBA.  This helper intentionally accepts
+        either representation and converts fixed tensors to the same packed
+        layout used by the native path.
+        """
+
+        if not torch.is_tensor(pixel_values):
+            pixel_values = torch.as_tensor(pixel_values)
+        if pixel_values.ndim == 3:
+            # A single fixed-resolution image in CHW form.
+            pixel_values = pixel_values.unsqueeze(0)
+
+        patch_size = int(self.patch_size)
+        patch_area = patch_size * patch_size
+        normalized_grid = None
+
+        if pixel_values.ndim == 4:
+            # [num_images, channels, height, width] (legacy fixed path).
+            image_tensor = pixel_values
+            image_count, channels, height, width = image_tensor.shape
+            if channels not in (3, 4):
+                raise ValueError(
+                    "Expected RGB/RGBA fixed-resolution images with 3 or 4 "
+                    f"channels, got shape {tuple(image_tensor.shape)}."
+                )
+            if height % patch_size or width % patch_size:
+                raise ValueError(
+                    "Fixed-resolution image dimensions must be divisible by "
+                    f"patch_size={patch_size}, got {(height, width)}."
+                )
+            inferred_grid = torch.tensor(
+                [[height // patch_size, width // patch_size]] * image_count,
+                dtype=torch.long,
+                device=image_tensor.device,
+            )
+            normalized_grid = self._normalize_patch_grid(
+                grid_hw, image_count, image_tensor.device
+            )
+            if normalized_grid is not None and not torch.equal(
+                normalized_grid, inferred_grid
+            ):
+                raise ValueError(
+                    "image_grid_hw does not match fixed-resolution tensor shape: "
+                    f"grid={normalized_grid.tolist()} tensor={tuple(image_tensor.shape)}."
+                )
+            normalized_grid = inferred_grid
+            packed = (
+                image_tensor.reshape(
+                    image_count,
+                    channels,
+                    height // patch_size,
+                    patch_size,
+                    width // patch_size,
+                    patch_size,
+                )
+                .permute(0, 2, 4, 1, 3, 5)
+                .reshape(-1, channels * patch_area)
+            )
+            return packed.contiguous(), normalized_grid, channels
+
+        if pixel_values.ndim != 2:
+            raise ValueError(
+                "Expected packed patches [N, C * patch_size**2] or fixed "
+                f"images [N, C, H, W], got {tuple(pixel_values.shape)}."
+            )
+
+        width = int(pixel_values.shape[-1])
+        if width == 3 * patch_area:
+            channels = 3
+        elif width == 4 * patch_area:
+            channels = 4
+        else:
+            raise ValueError(
+                "Expected packed RGB/RGBA patches with width "
+                f"{3 * patch_area} or {4 * patch_area}, got {tuple(pixel_values.shape)}."
+            )
+
+        # Pure channel conversion helpers (called without grid metadata) do
+        # not need to guess image geometry.  Target construction/forward pass
+        # supplies ``num_images`` and therefore still gets strict grid
+        # validation and inference for legacy fixed-size packed features.
+        if num_images is None and grid_hw is None:
+            return pixel_values.contiguous(), None, channels
+        if num_images is None:
+            # A supplied grid determines the image count.
+            supplied_grid = torch.as_tensor(grid_hw)
+            num_images = 1 if supplied_grid.ndim == 1 else supplied_grid.shape[0]
+        normalized_grid = self._normalize_patch_grid(
+            grid_hw, int(num_images), pixel_values.device
+        )
+        if normalized_grid is None:
+            normalized_grid = self._infer_packed_grid(
+                pixel_values.shape[0], num_images=int(num_images), device=pixel_values.device
+            )
+        expected_patches = int(
+            (normalized_grid[:, 0] * normalized_grid[:, 1]).sum().item()
+        )
+        if expected_patches != pixel_values.shape[0]:
+            raise ValueError(
+                "Packed patches do not match image grids: "
+                f"patches={pixel_values.shape[0]}, expected={expected_patches}, "
+                f"grid={normalized_grid.tolist()}."
+            )
+        return pixel_values.contiguous(), normalized_grid, channels
+
+    def _to_rgba_patch_values(self, pixel_values, grid_hw=None, num_images=None):
+        """Canonicalize RGB/RGBA image data to packed RGBA patches."""
+
+        packed, normalized_grid, channels = self._canonicalize_image_patches(
+            pixel_values,
+            grid_hw=grid_hw,
+            num_images=num_images,
+        )
+        if channels == 4:
+            return packed, normalized_grid
+
+        patch_area = int(self.patch_size) ** 2
+        rgb = packed.reshape(-1, 3, int(self.patch_size), int(self.patch_size))
+        alpha = torch.ones(
+            (rgb.shape[0], 1, int(self.patch_size), int(self.patch_size)),
+            dtype=rgb.dtype,
+            device=rgb.device,
+        )
+        rgba = torch.cat((rgb, alpha), dim=1).reshape(-1, 4 * patch_area)
+        return rgba.contiguous(), normalized_grid
+
+    def _rgba_to_understanding_patch_values(
+        self, pixel_values, grid_hw=None, num_images=None
+    ):
+        """Convert RGB/RGBA packed or fixed images to RGB packed patches."""
+
+        packed, _, channels = self._canonicalize_image_patches(
+            pixel_values,
+            grid_hw=grid_hw,
+            num_images=num_images,
+        )
+        if channels == 3:
+            return packed
+        patch_area = int(self.patch_size) ** 2
+        return (
+            packed.reshape(-1, 4, int(self.patch_size), int(self.patch_size))[:, :3]
+            .contiguous()
+            .reshape(-1, 3 * patch_area)
+        )
+
+    def _rgba_to_generation_patch_values(
+        self, pixel_values, grid_hw=None, num_images=None
+    ):
+        """Convert RGB/RGBA image data to the configured generation channels."""
+
+        rgba, _ = self._to_rgba_patch_values(
+            pixel_values,
+            grid_hw=grid_hw,
+            num_images=num_images,
+        )
+        return self._select_generation_channels(rgba)
+
+    def _select_generation_channels(self, rgba):
+        """Select RGB/RGBA channels from already canonical RGBA patches."""
+
+        patch_area = int(self.patch_size) ** 2
+        values = rgba.reshape(-1, 4, int(self.patch_size), int(self.patch_size))
+        if self.image_gen_channels not in (3, 4):
+            raise ValueError(
+                "image_gen_channels must be 3 or 4, "
+                f"got {self.image_gen_channels!r}."
+            )
+        return (
+            values[:, : self.image_gen_channels]
+            .contiguous()
+            .reshape(-1, self.image_gen_channels * patch_area)
+        )
+
+    def _merge_generation_patches(
+        self,
+        pixel_values,
+        image_h,
+        image_w,
+        patch_size,
+        merge_size,
+    ):
+        return (
+            pixel_values.view(
+                image_h // merge_size,
+                merge_size,
+                image_w // merge_size,
+                merge_size,
+                self.image_gen_channels,
+                patch_size,
+                patch_size,
+            )
+            .permute(0, 2, 1, 5, 3, 6, 4)
+            .contiguous()
+            .view(
+                -1,
+                self.image_gen_channels * (patch_size * merge_size) ** 2,
+            )
+        )
+
+    def prepare_image_gen_targets(
+        self,
+        pixel_values,
+        image_for_gen_flags,
+        grid_hw,
+        layer_group_ids=None,
+        layer_indices=None,
+    ):
+        image_for_gen_flags = torch.as_tensor(
+            image_for_gen_flags,
+            dtype=torch.bool,
+            device=pixel_values.device if torch.is_tensor(pixel_values) else None,
+        ).flatten()
+        has_generation = bool(image_for_gen_flags.any().item())
+
+        # Preserve the old fast path for conditioning-only RGB features.  In
+        # particular, legacy callers sometimes omitted ``grid_hw`` when no
+        # image was generated; channel conversion is still unambiguous even
+        # though image geometry is not.
+        if not has_generation:
+            try:
+                has_grid = grid_hw is not None and torch.as_tensor(grid_hw).numel() > 0
+            except (TypeError, ValueError, RuntimeError):
+                # Older collators may keep a list of tensors instead of a
+                # single stacked grid; that still represents valid metadata.
+                has_grid = grid_hw is not None and len(grid_hw) > 0
+            pixel_values, _ = self._to_rgba_patch_values(
+                pixel_values,
+                grid_hw=grid_hw,
+                num_images=(
+                    image_for_gen_flags.numel()
+                    if has_grid
+                    else None
+                ),
+            )
+            return (
+                self._select_generation_channels(pixel_values),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        # Canonicalize both legacy RGB and layered RGBA inputs.  Fixed
+        # resolution callers provide [N, C, H, W] and generally omit grid_hw;
+        # the helper derives one grid per image in that case.
+        pixel_values, inferred_grid_hw = self._to_rgba_patch_values(
+            pixel_values,
+            grid_hw=grid_hw,
+            num_images=image_for_gen_flags.numel(),
+        )
+        grid_hw = inferred_grid_hw
+        if grid_hw is None:
+            raise ValueError("Unable to determine image grids for generation targets.")
+
+        patch_size = int(self.patch_size)
+        merge_size = round(1 / self.downsample_ratio)
+        expected_width = 4 * patch_size * patch_size
+        if pixel_values.shape[-1] != expected_width:
+            # This should only be reachable if a custom canonicalizer is
+            # supplied by a downstream subclass; retain a useful diagnostic.
+            raise ValueError(
+                f"Expected packed RGBA patches [N, {expected_width}], "
+                f"got {tuple(pixel_values.shape)}."
+            )
+        if len(pixel_values) != int((grid_hw[:, 0] * grid_hw[:, 1]).sum().item()):
+            raise ValueError("Packed RGBA patches do not match image grid sizes.")
+        if len(image_for_gen_flags) != len(grid_hw):
+            raise ValueError("Generation flags must contain one entry per image.")
+
+        if layer_group_ids is None and layer_indices is None:
+            # Backward-compatible single-image generation callers used the
+            # pre-layered three-argument API.  Treat every generated image as
+            # an independent one-layer group when metadata is absent.
+            layer_group_ids = torch.full(
+                (len(grid_hw),),
+                -1,
+                dtype=torch.long,
+                device=grid_hw.device,
+            )
+            layer_indices = torch.zeros_like(layer_group_ids)
+            layer_group_ids[image_for_gen_flags] = torch.arange(
+                int(image_for_gen_flags.sum().item()),
+                dtype=torch.long,
+                device=grid_hw.device,
+            )
+        elif layer_group_ids is None or layer_indices is None:
+            raise ValueError(
+                "layer_group_ids and layer_indices must either both be provided "
+                "or both be omitted."
+            )
+        if len(layer_group_ids) != len(grid_hw) or len(layer_indices) != len(grid_hw):
+            raise ValueError(
+                "Layer metadata must contain one entry per image: "
+                f"groups={len(layer_group_ids)}, layers={len(layer_indices)}, "
+                f"images={len(grid_hw)}."
+            )
+
         image_gen_x = []
         image_gen_z = []
         image_gen_t = []
         image_gen_pos_ids = []
         image_gen_noise_scale = []
-
-        # for all images
         pixel_values_updated = []
 
-        
-        und_mean = torch.tensor([0.485, 0.456, 0.406], device=pixel_values.device, dtype=pixel_values.dtype).view(1, 3, 1, 1)
-        und_std  = torch.tensor([0.229, 0.224, 0.225],  device=pixel_values.device, dtype=pixel_values.dtype).view(1, 3, 1, 1)
+        und_mean = torch.tensor(
+            [0.485, 0.456, 0.406],
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        ).view(1, 3, 1, 1)
+        und_std = torch.tensor(
+            [0.229, 0.224, 0.225],
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        ).view(1, 3, 1, 1)
 
+        group_timesteps = {}
         image_token_accum = 0
         for image_i in range(len(image_for_gen_flags)):
-            cur_image_h = grid_hw[image_i, 0]
-            cur_image_w = grid_hw[image_i, 1]
+            cur_image_h = int(grid_hw[image_i, 0])
+            cur_image_w = int(grid_hw[image_i, 1])
             cur_image_token_num = cur_image_h * cur_image_w
+            image_slice = pixel_values[
+                image_token_accum : image_token_accum + cur_image_token_num
+            ]
+
             if image_for_gen_flags[image_i]:
-                cur_pixel_values = pixel_values[image_token_accum:image_token_accum+cur_image_token_num].clone()
-                cur_pixel_values = cur_pixel_values.view(-1, 3, self.patch_size, self.patch_size)
-                cur_pixel_values = (cur_pixel_values * und_std + und_mean).clamp(0, 1).view(-1, 3*self.patch_size*self.patch_size)
-                cur_pixel_values = (cur_pixel_values - 0.5) * 2
-                noise_scale = self.noise_scale
+                cur_rgba = image_slice.clone().view(
+                    -1, 4, patch_size, patch_size
+                )
+                rgb = (cur_rgba[:, :3] * und_std + und_mean).clamp(0, 1)
+                if self.image_gen_channels == 4:
+                    output_pixels = torch.cat((rgb, cur_rgba[:, 3:4]), dim=1)
+                else:
+                    output_pixels = rgb
+                cur_pixel_values = (output_pixels.flatten(1) - 0.5) * 2
+
                 image_seq_len = cur_image_token_num // (merge_size**2)
+                noise_scale = self.noise_scale
                 if self.noise_scale_mode in ("resolution", "dynamic"):
                     base = float(self.noise_scale_base_image_seq_len)
-                    scale = math.sqrt(image_seq_len/base)
-                    noise_scale = scale * float(self.noise_scale)
+                    noise_scale = (
+                        math.sqrt(image_seq_len / base) * float(self.noise_scale)
+                    )
                 cur_noise = torch.randn_like(cur_pixel_values) * noise_scale
 
-                u = torch.normal(mean=0.0, std=1.0, size=(1,), device=pixel_values.device) * self.P_std + self.P_mean
-                t = (1 / (1 + torch.exp(-u))).to(dtype=pixel_values.dtype, device=pixel_values.device)
+                group_id = int(layer_group_ids[image_i])
+                is_new_group = group_id not in group_timesteps
+                if is_new_group:
+                    u = (
+                        torch.normal(
+                            mean=0.0,
+                            std=1.0,
+                            size=(1,),
+                            device=pixel_values.device,
+                        )
+                        * self.P_std
+                        + self.P_mean
+                    )
+                    t = (1 / (1 + torch.exp(-u))).to(
+                        dtype=pixel_values.dtype,
+                        device=pixel_values.device,
+                    )
+                else:
+                    t, group_canvas = group_timesteps[group_id]
+                    if group_canvas != (cur_image_h, cur_image_w):
+                        raise ValueError(
+                            "All layers in one group must share a canvas: "
+                            f"group {group_id} has canvases {group_canvas} and "
+                            f"{(cur_image_h, cur_image_w)}."
+                        )
 
-                # Synchronize random noise and timestep across TP ranks to ensure
-                # identical flow-matching targets for the same image on all ranks.
                 if self.tp_world_size > 1:
                     tp_group = gpc.get_group(ParallelMode.TENSOR)
                     tp_ranks = gpc.get_ranks_in_group(ParallelMode.TENSOR)
                     dist.broadcast(cur_noise, src=tp_ranks[0], group=tp_group)
-                    dist.broadcast(t, src=tp_ranks[0], group=tp_group)
+                    if is_new_group:
+                        dist.broadcast(t, src=tp_ranks[0], group=tp_group)
 
-                t = self._apply_time_schedule(t, image_seq_len)
+                if is_new_group:
+                    t = self._apply_time_schedule(t, image_seq_len)
+                    group_timesteps[group_id] = (
+                        t,
+                        (cur_image_h, cur_image_w),
+                    )
 
                 t_expanded = t.expand(cur_image_token_num)
-                t_expanded_merged = t.expand(cur_image_token_num // merge_size**2)
-
-                cur_image_gen_z = t_expanded.view(-1, 1) * cur_pixel_values + (1 - t_expanded.view(-1, 1)) * cur_noise
+                t_expanded_merged = t.expand(image_seq_len)
+                cur_image_gen_z = (
+                    t_expanded.view(-1, 1) * cur_pixel_values
+                    + (1 - t_expanded.view(-1, 1)) * cur_noise
+                )
                 pixel_values_updated.append(cur_image_gen_z)
-
                 image_gen_t.append(t_expanded_merged)
-                image_gen_noise_scale.append(torch.full_like(t_expanded_merged, noise_scale/self.noise_scale_max_value))
-
-                # for prediction after patch merged
-                cur_pixel_values_reshape = cur_pixel_values.view(cur_image_h//merge_size, merge_size, cur_image_w//merge_size, merge_size, 3, patch_size, patch_size)
-                cur_pixel_values_reshape = torch.einsum("h a w b c i j -> h w a i b j c", cur_pixel_values_reshape).contiguous().view(-1, patch_size_after_downsample**2*3)
-
-                cur_image_gen_z_reshape = cur_image_gen_z.view(cur_image_h//merge_size, merge_size, cur_image_w//merge_size, merge_size, 3, patch_size, patch_size)
-                cur_image_gen_z_reshape = torch.einsum("h a w b c i j -> h w a i b j c", cur_image_gen_z_reshape).contiguous().view(-1, patch_size_after_downsample**2*3)
-
-                image_gen_x.append(cur_pixel_values_reshape)
-                image_gen_z.append(cur_image_gen_z_reshape)
-
-                per_image_pos = self.get_per_image_pos_ids(grid_hw[image_i])
-                image_gen_pos_ids.append(per_image_pos)
+                image_gen_noise_scale.append(
+                    torch.full_like(
+                        t_expanded_merged,
+                        noise_scale / self.noise_scale_max_value,
+                    )
+                )
+                image_gen_x.append(
+                    self._merge_generation_patches(
+                        cur_pixel_values,
+                        cur_image_h,
+                        cur_image_w,
+                        patch_size,
+                        merge_size,
+                    )
+                )
+                image_gen_z.append(
+                    self._merge_generation_patches(
+                        cur_image_gen_z,
+                        cur_image_h,
+                        cur_image_w,
+                        patch_size,
+                        merge_size,
+                    )
+                )
+                image_gen_pos_ids.append(self.get_per_image_pos_ids(grid_hw[image_i]))
             else:
-                cur_pixel_values = pixel_values[image_token_accum:image_token_accum+cur_image_token_num]
-                pixel_values_updated.append(cur_pixel_values)
+                pixel_values_updated.append(
+                    self._select_generation_channels(image_slice)
+                )
 
             image_token_accum += cur_image_token_num
 
-        pixel_values_updated = torch.cat(pixel_values_updated, 0)
-        image_gen_x = torch.cat(image_gen_x, 0)
-        image_gen_z = torch.cat(image_gen_z, 0)
-    
-        image_gen_t = torch.cat(image_gen_t, 0).view(-1,)
-        image_gen_noise_scale = torch.cat(image_gen_noise_scale, 0).view(-1,)
-        image_gen_pos_ids = torch.cat(image_gen_pos_ids, 0).view(-1,)
+        pixel_values_updated = torch.cat(pixel_values_updated, dim=0)
+        image_gen_x = torch.cat(image_gen_x, dim=0)
+        image_gen_z = torch.cat(image_gen_z, dim=0)
+        image_gen_t = torch.cat(image_gen_t, dim=0).view(-1)
+        image_gen_noise_scale = torch.cat(image_gen_noise_scale, dim=0).view(-1)
+        image_gen_pos_ids = torch.cat(image_gen_pos_ids, dim=0).view(-1)
+        image_gen_v = (image_gen_x - image_gen_z) / (
+            1 - image_gen_t.view(-1, 1)
+        ).clamp_min(self.t_eps)
 
-        image_gen_v = (image_gen_x - image_gen_z) / (1 - image_gen_t.view(-1, 1)).clamp_min(self.t_eps)
-        
-        return pixel_values_updated, image_gen_z, image_gen_v, image_gen_t, image_gen_pos_ids, image_gen_noise_scale
+        return (
+            pixel_values_updated,
+            image_gen_z,
+            image_gen_v,
+            image_gen_t,
+            image_gen_pos_ids,
+            image_gen_noise_scale,
+        )
 
     def build_image_gen_indicators(
         self,
@@ -706,6 +1371,131 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
 
         return out
 
+    @staticmethod
+    def _normalize_layer_metadata(
+        image_for_gen_flags,
+        layer_group_ids,
+        layer_indices,
+        device,
+    ):
+        gen_flags = torch.as_tensor(
+            image_for_gen_flags,
+            dtype=torch.bool,
+            device=device,
+        ).flatten()
+        num_images = gen_flags.numel()
+
+        if (layer_group_ids is None) != (layer_indices is None):
+            raise ValueError(
+                "layer_group_ids and layer_indices must either both be provided "
+                "or both be omitted."
+            )
+        if layer_group_ids is None:
+            groups = torch.full(
+                (num_images,), -1, dtype=torch.long, device=device
+            )
+            layers = torch.zeros(
+                (num_images,), dtype=torch.long, device=device
+            )
+            groups[gen_flags] = torch.arange(
+                int(gen_flags.sum().item()),
+                dtype=torch.long,
+                device=device,
+            )
+            return gen_flags, groups, layers
+
+        groups = torch.as_tensor(
+            layer_group_ids,
+            dtype=torch.long,
+            device=device,
+        ).flatten()
+        layers = torch.as_tensor(
+            layer_indices,
+            dtype=torch.long,
+            device=device,
+        ).flatten()
+
+        if groups.numel() != num_images or layers.numel() != num_images:
+            raise ValueError(
+                "Layer metadata must contain one entry per image: "
+                f"groups={groups.numel()}, layers={layers.numel()}, "
+                f"images={num_images}."
+            )
+        if (groups[gen_flags] < 0).any() or (layers[gen_flags] < 0).any():
+            raise ValueError(
+                "Generated images require non-negative layer group and layer indices."
+            )
+
+        groups = torch.where(gen_flags, groups, -1)
+        layers = torch.where(gen_flags, layers, 0)
+        generated_groups = groups[gen_flags]
+        generated_layers = layers[gen_flags]
+        for group_id in torch.unique(generated_groups):
+            group_positions = torch.nonzero(
+                generated_groups == group_id,
+                as_tuple=True,
+            )[0]
+            if (
+                group_positions.numel() > 1
+                and not torch.all(group_positions[1:] == group_positions[:-1] + 1)
+            ):
+                raise ValueError(
+                    f"Generated images in layer group {int(group_id)} must be consecutive."
+                )
+            group_layers = generated_layers[group_positions]
+            expected = torch.arange(
+                group_layers.numel(),
+                dtype=group_layers.dtype,
+                device=group_layers.device,
+            )
+            if not torch.equal(group_layers, expected):
+                raise ValueError(
+                    f"Layer group {int(group_id)} must be indexed 0..N-1; "
+                    f"got {group_layers.tolist()}."
+                )
+        return gen_flags, groups, layers
+
+    @staticmethod
+    def _has_layered_generation(image_for_gen_flags, layer_group_ids):
+        generated_groups = layer_group_ids[image_for_gen_flags]
+        if generated_groups.numel() < 2:
+            return False
+        return bool((torch.unique(generated_groups, return_counts=True)[1] > 1).any())
+
+    @staticmethod
+    def _build_image_value_indicators(
+        modality_indicators,
+        image_values,
+        default_value,
+        image_id_base=1,
+    ):
+        out = torch.full_like(modality_indicators, default_value)
+        image_mask = modality_indicators >= 0
+        image_ids = modality_indicators[image_mask] - image_id_base
+        valid = (image_ids >= 0) & (image_ids < image_values.numel())
+        if valid.any():
+            out_positions = image_mask.nonzero(as_tuple=True)[0][valid]
+            out[out_positions] = image_values[image_ids[valid]]
+        return out
+
+    def _build_layer_token_indicators(
+        self,
+        modality_indicators,
+        image_gen_indicators,
+        layer_group_ids,
+        layer_indices,
+    ):
+        gen_tokens = image_gen_indicators.view(-1)
+        groups = self._build_image_value_indicators(
+            modality_indicators, layer_group_ids, -1
+        )
+        layers = self._build_image_value_indicators(
+            modality_indicators, layer_indices, 0
+        )
+        return torch.where(gen_tokens, groups, -1), torch.where(
+            gen_tokens, layers, 0
+        )
+
     def forward(  # pylint: disable=W0102
         self,
         hidden_states=None,
@@ -720,6 +1510,8 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         indexes=None,   # 8192
         inference_params=None,
         type_ids=None,
+        layer_group_ids: Optional[torch.LongTensor] = None,
+        layer_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         pad_dummy_image_gen = gpc.config.get("pad_dummy_image_gen", False)
@@ -730,6 +1522,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
         moe_losses, moe_z_losses, moe_coef_losses = [], [], []
         moe_outputs: List[SenseNovaVLMoEOutput] = []
         mtp_outputs = None
+        layered_generation = False
         pure_text = False
         if image_flags is None or (len(image_flags) == 1 and image_flags[0] is None) or image_flags[0].sum() == 0:
             pure_text = True
@@ -745,7 +1538,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     images = [
                         torch.rand(
                             segments**2,
-                            3 * self.patch_size * self.patch_size,
+                            4 * self.patch_size * self.patch_size,
                             device=get_current_device(),
                             dtype=gpc.config.model.dtype,
                         )
@@ -755,7 +1548,7 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     images = [
                         torch.rand(
                             1,
-                            3,
+                            4,
                             self.image_size,
                             self.image_size,
                             device=get_current_device(),
@@ -765,26 +1558,128 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 image_flags = [torch.tensor([0], dtype=torch.long, device=get_current_device())]
                 image_for_gen_flags = [torch.tensor([0], dtype=torch.long, device=get_current_device())]
                 is_image_duplicated_for_und_flags = [torch.tensor([0], dtype=torch.long, device=get_current_device())]
+                layer_group_ids = None
+                layer_indices = None
 
             assert isinstance(images, list), "images should be a list."
             assert len(images) == input_ids.shape[0] == 1, "len(images) and input_ids.shape[0] should be 1."
 
             images = images[0]
             images = images.to(self.dtype)
+            fixed_resolution_input = images.ndim in (3, 4)
+
+            # ``random_multimodal_packed_streaming`` pads fixed-resolution
+            # image batches to the largest image count across data-parallel
+            # ranks.  Those dummy images have image_flags == 0 and do not
+            # have corresponding image tokens/metadata.  Drop them before
+            # deriving grids; otherwise native-style sequence lengths would
+            # be longer than the text context.  Keep one all-zero dummy for
+            # the pure-text path, which intentionally keeps the vision branch
+            # in the autograd graph.
+            if fixed_resolution_input and image_flags is not None:
+                raw_image_flags = image_flags[0] if isinstance(image_flags, list) else image_flags
+                raw_image_flags = torch.as_tensor(raw_image_flags, device=images.device).flatten()
+                image_count = int(images.shape[0]) if images.ndim == 4 else 1
+                if raw_image_flags.numel() == image_count and image_count > 1:
+                    valid_image_flags = raw_image_flags.ne(0)
+                    if bool(valid_image_flags.any()):
+                        images = images[valid_image_flags] if images.ndim == 4 else images
+                        image_flags = [raw_image_flags[valid_image_flags]]
+
+                        def _filter_image_metadata(value):
+                            if value is None:
+                                return value
+                            wrapped = isinstance(value, list)
+                            inner = value[0] if wrapped and len(value) == 1 else value
+                            try:
+                                inner_tensor = torch.as_tensor(inner)
+                            except (TypeError, ValueError):
+                                return value
+                            if inner_tensor.ndim != 1 or inner_tensor.numel() != image_count:
+                                return value
+                            filtered = inner_tensor[valid_image_flags]
+                            return [filtered] if wrapped and len(value) == 1 else filtered
+
+                        image_for_gen_flags = _filter_image_metadata(image_for_gen_flags)
+                        is_image_duplicated_for_und_flags = _filter_image_metadata(
+                            is_image_duplicated_for_und_flags
+                        )
+                        layer_group_ids = _filter_image_metadata(layer_group_ids)
+                        layer_indices = _filter_image_metadata(layer_indices)
+
+            # ``image_for_gen_flags`` is per image (not per patch).  Keep the
+            # count around while normalizing old fixed-resolution tensors so
+            # that packed inputs without an explicit grid can still be split.
+            num_images = int(torch.as_tensor(image_for_gen_flags[0]).numel())
             if self.dynamic_image_version == 'native_resolution':
-                grid_hw = grid_hw[0]
+                if (
+                    isinstance(grid_hw, (list, tuple))
+                    and len(grid_hw) == 1
+                    and isinstance(grid_hw[0], (list, tuple, torch.Tensor))
+                ):
+                    grid_hw = grid_hw[0]
                 if image_seq_lens is not None:
-                    image_seq_lens = image_seq_lens[0]
+                    if (
+                        isinstance(image_seq_lens, (list, tuple))
+                        and len(image_seq_lens) == 1
+                        and isinstance(image_seq_lens[0], (list, tuple, torch.Tensor))
+                    ):
+                        image_seq_lens = image_seq_lens[0]
+                if (
+                    isinstance(layer_group_ids, list)
+                    and len(layer_group_ids) == 1
+                    and isinstance(layer_group_ids[0], (list, tuple, torch.Tensor))
+                ):
+                    layer_group_ids = layer_group_ids[0]
+                if (
+                    isinstance(layer_indices, list)
+                    and len(layer_indices) == 1
+                    and isinstance(layer_indices[0], (list, tuple, torch.Tensor))
+                ):
+                    layer_indices = layer_indices[0]
             else:
-                grid_hw = None
+                # The pre-layered fixed-resolution dataloader returned a
+                # stacked [N, C, H, W] tensor and no grid metadata.  Convert
+                # it to the native packed representation here; this also
+                # accepts legacy RGB tensors and supplies an opaque alpha
+                # channel for a layered generation branch.
                 image_seq_lens = None
-            
-            assert grid_hw is not None
+
+            images, grid_hw = self._to_rgba_patch_values(
+                images,
+                grid_hw=grid_hw,
+                num_images=num_images,
+            )
+            if grid_hw is None:
+                raise ValueError("Unable to determine image grids from image inputs.")
+
+            image_for_gen_flags[0], layer_group_ids, layer_indices = (
+                self._normalize_layer_metadata(
+                    image_for_gen_flags[0],
+                    layer_group_ids,
+                    layer_indices,
+                    images.device,
+                )
+            )
+            layered_generation = self._has_layered_generation(
+                image_for_gen_flags[0], layer_group_ids
+            )
+            images_und = self._rgba_to_understanding_patch_values(
+                images,
+                grid_hw=grid_hw,
+                num_images=num_images,
+            )
             # image gen
-            pixel_values_updated, image_gen_z, image_gen_v, image_gen_t, image_gen_pos_ids, image_gen_noise_scale = self.prepare_image_gen_targets(images, image_for_gen_flags[0], grid_hw)
+            pixel_values_updated, image_gen_z, image_gen_v, image_gen_t, image_gen_pos_ids, image_gen_noise_scale = self.prepare_image_gen_targets(
+                images,
+                image_for_gen_flags[0],
+                grid_hw,
+                layer_group_ids=layer_group_ids,
+                layer_indices=layer_indices,
+            )
 
             vit_embeds, vit_embeds_image_gen, vit_moe_outputs, cls_embeds = self.extract_feature(     # NOTE:
-                images, pixel_values_updated, image_flags=image_flags, return_cls=True, grid_hw=grid_hw
+                images_und, pixel_values_updated, image_flags=image_flags, return_cls=True, grid_hw=grid_hw
             )
             assert cls_embeds is None   # NOTE:
 
@@ -845,6 +1740,10 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                         modality_indicators = torch.ones_like(input_ids[0]) * -1
                         image_gen_indicators = torch.zeros_like(input_ids[0], dtype=torch.bool).view(1, -1)
                         dup_boundary = torch.zeros_like(input_ids[0], dtype=torch.bool)
+                    layer_group_indicators = torch.full_like(
+                        modality_indicators, -1
+                    )
+                    layer_index_indicators = torch.zeros_like(modality_indicators)
                     image_gen_t = None
                     image_gen_noise_scale = None
                     
@@ -886,44 +1785,51 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
 
                         abs_pos_w, abs_pos_h = build_abs_positions_from_grid_hw(grid_hw // merge_size, device=indexes.device)
 
-                        modality_indicators, prompt_image_seq_lens = build_modality_indicators_from_context_runs(full_selected)
-                        full_selected, _, kept_image_seq_lens = align_selected_to_image_seq_lens(
-                            full_selected,
-                            modality_indicators,
-                            expected_image_seq_lens,
-                        )
-                        prompt_total_ctx = int(sum(prompt_image_seq_lens))
-                        expected_total_ctx = int(sum(int(x) for x in expected_image_seq_lens))
-                        kept_total_ctx = int(sum(int(x) for x in kept_image_seq_lens))
-                        dropped_ctx = max(prompt_total_ctx - kept_total_ctx, 0)
-                        if prompt_total_ctx != expected_total_ctx:
-                            logger.warning(
-                                "[image_gen][isp] image context token count mismatch: prompt=%s expected=%s kept=%s dropped=%s",
-                                prompt_total_ctx,
-                                expected_total_ctx,
-                                kept_total_ctx,
-                                dropped_ctx,
-                            )
-
-                        if prompt_image_seq_lens != expected_image_seq_lens:
-                            mismatched_images, first_mismatch_idx, prompt_len, expected_len = summarize_image_seq_mismatch(
-                                prompt_image_seq_lens,
+                        if layered_generation:
+                            modality_indicators = build_modality_indicators(
+                                full_selected,
                                 expected_image_seq_lens,
                             )
-                            logger.warning(
-                                "[image_gen][isp] image context run mismatch: prompt=%s expected=%s kept=%s "
-                                "prompt_runs=%s expected_images=%s mismatched_images=%s "
-                                "first_mismatch_idx=%s prompt_len=%s expected_len=%s",
-                                sum(prompt_image_seq_lens),
-                                sum(expected_image_seq_lens),
-                                sum(kept_image_seq_lens),
-                                len(prompt_image_seq_lens),
-                                len(expected_image_seq_lens),
-                                mismatched_images,
-                                first_mismatch_idx,
-                                prompt_len,
-                                expected_len,
+                            kept_image_seq_lens = expected_image_seq_lens
+                        else:
+                            modality_indicators, prompt_image_seq_lens = build_modality_indicators_from_context_runs(full_selected)
+                            full_selected, _, kept_image_seq_lens = align_selected_to_image_seq_lens(
+                                full_selected,
+                                modality_indicators,
+                                expected_image_seq_lens,
                             )
+                            prompt_total_ctx = int(sum(prompt_image_seq_lens))
+                            expected_total_ctx = int(sum(int(x) for x in expected_image_seq_lens))
+                            kept_total_ctx = int(sum(int(x) for x in kept_image_seq_lens))
+                            dropped_ctx = max(prompt_total_ctx - kept_total_ctx, 0)
+                            if prompt_total_ctx != expected_total_ctx:
+                                logger.warning(
+                                    "[image_gen][isp] image context token count mismatch: prompt=%s expected=%s kept=%s dropped=%s",
+                                    prompt_total_ctx,
+                                    expected_total_ctx,
+                                    kept_total_ctx,
+                                    dropped_ctx,
+                                )
+
+                            if prompt_image_seq_lens != expected_image_seq_lens:
+                                mismatched_images, first_mismatch_idx, prompt_len, expected_len = summarize_image_seq_mismatch(
+                                    prompt_image_seq_lens,
+                                    expected_image_seq_lens,
+                                )
+                                logger.warning(
+                                    "[image_gen][isp] image context run mismatch: prompt=%s expected=%s kept=%s "
+                                    "prompt_runs=%s expected_images=%s mismatched_images=%s "
+                                    "first_mismatch_idx=%s prompt_len=%s expected_len=%s",
+                                    sum(prompt_image_seq_lens),
+                                    sum(expected_image_seq_lens),
+                                    sum(kept_image_seq_lens),
+                                    len(prompt_image_seq_lens),
+                                    len(expected_image_seq_lens),
+                                    mismatched_images,
+                                    first_mismatch_idx,
+                                    prompt_len,
+                                    expected_len,
+                                )
 
                         vit_embeds = slice_tensor_by_image_lens(vit_embeds, expected_image_seq_lens, kept_image_seq_lens, dim=0)
                         vit_embeds_image_gen = slice_tensor_by_image_lens(vit_embeds_image_gen, expected_image_seq_lens, kept_image_seq_lens, dim=0)
@@ -953,6 +1859,11 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
 
                             k = int(image_gen_indicators.sum().item())
                             m = image_gen_z.shape[0]
+                            if layered_generation and k != m:
+                                raise RuntimeError(
+                                    "[image_gen][isp] generated context tokens and "
+                                    f"targets must align exactly, got tokens={k}, targets={m}."
+                                )
                             if m < k:
                                 logger.warning(
                                     "[image_gen][isp] indicators mismatch: indicators=%s > targets=%s.",
@@ -976,6 +1887,16 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                             image_gen_noise_scale = image_gen_noise_scale[:k]
                             image_gen_pos_ids = image_gen_pos_ids[:k]
 
+                        (
+                            layer_group_indicators,
+                            layer_index_indicators,
+                        ) = self._build_layer_token_indicators(
+                            modality_indicators,
+                            image_gen_indicators,
+                            layer_group_ids,
+                            layer_indices,
+                        )
+
                         full_hidden_states = full_hidden_states.clone()
                         gen_flags = image_gen_indicators[full_selected]
                         mixed = torch.where(gen_flags[:, None], vit_embeds_image_gen, vit_embeds)
@@ -996,10 +1917,20 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                         pos_w[selected[0]] = abs_pos_w.to(dtype=indexes.dtype)
                         indexes = torch.stack([indexes, pos_h, pos_w], dim=-1)
 
-                        img_start_flags = (input_ids[0] == self.img_start_token_id).long()
-                        shifted_flags = torch.cat([torch.zeros(1, dtype=torch.long, device=input_ids.device), img_start_flags], dim=0)[:-1]
-                        modality_indicators = shifted_flags.cumsum(0)
-                        modality_indicators[input_ids[0] != self.img_context_token_id] = -1
+                        if layered_generation:
+                            exact_image_seq_lens = get_image_seq_lens(
+                                grid_hw,
+                                round(1 / self.downsample_ratio),
+                            )
+                            modality_indicators = build_modality_indicators(
+                                selected,
+                                exact_image_seq_lens,
+                            )
+                        else:
+                            img_start_flags = (input_ids[0] == self.img_start_token_id).long()
+                            shifted_flags = torch.cat([torch.zeros(1, dtype=torch.long, device=input_ids.device), img_start_flags], dim=0)[:-1]
+                            modality_indicators = shifted_flags.cumsum(0)
+                            modality_indicators[input_ids[0] != self.img_context_token_id] = -1
                         image_gen_indicators = self.build_image_gen_indicators(modality_indicators, image_for_gen_flags[0]).view(1, -1)
                         image_duplicated_for_und_indicators = self.build_image_gen_indicators(modality_indicators, is_image_duplicated_for_und_flags[0]).view(1, -1)
                         dup_boundary = build_dup_boundary(modality_indicators.view(-1), image_gen_indicators.view(-1), image_duplicated_for_und_indicators.view(-1))
@@ -1008,6 +1939,11 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                             # avoid length mismatch in some rare cases
                             k = int(image_gen_indicators.sum().item())
                             m = image_gen_z.shape[0]
+                            if layered_generation and k != m:
+                                raise RuntimeError(
+                                    "[image_gen] generated context tokens and targets "
+                                    f"must align exactly, got tokens={k}, targets={m}."
+                                )
                             if m < k:
                                 logger.warning(f"[image_gen] indicators length mismatch: indicators={k} > targets={m}. Truncating indicators to match targets.")
                                 flat_indicators = image_gen_indicators.view(-1)
@@ -1023,6 +1959,16 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                             image_gen_t = image_gen_t[:k]
                             image_gen_noise_scale = image_gen_noise_scale[:k]
                             image_gen_pos_ids = image_gen_pos_ids[:k]
+
+                        (
+                            layer_group_indicators,
+                            layer_index_indicators,
+                        ) = self._build_layer_token_indicators(
+                            modality_indicators,
+                            image_gen_indicators,
+                            layer_group_ids,
+                            layer_indices,
+                        )
               
                         hidden_states = hidden_states.clone()
                         gen_flags = image_gen_indicators[selected]
@@ -1080,11 +2026,17 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                             noise_scale_embedding = self.fm_modules['noise_scale_embedder'](image_gen_noise_scale)
                             timestep_embeddings = timestep_embeddings + noise_scale_embedding
                         image_gen_z = torch.zeros(
-                            (pad_dummy_image_num, patch_size_after_downsample**2*3),
+                            (
+                                pad_dummy_image_num,
+                                patch_size_after_downsample**2 * self.image_gen_channels,
+                            ),
                             device=hidden_states.device, dtype=hidden_states.dtype
                         )
                         image_gen_v = torch.zeros(
-                            (pad_dummy_image_num, patch_size_after_downsample**2*3),
+                            (
+                                pad_dummy_image_num,
+                                patch_size_after_downsample**2 * self.image_gen_channels,
+                            ),
                             device=hidden_states.device, dtype=hidden_states.dtype
                         )                 
 
@@ -1102,12 +2054,26 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 _has_pad = input_ids[0][-1] == 0
             document_ids = _offsets_to_doc_ids_tensor(cu_seqlens, has_pad=_has_pad)
             # for the mot strucutre, we split the vision gen tokens and other tokens and pack them
-            hidden_states_packed, indexes_packed, document_ids_packed, modality_indicators_packed, image_gen_indicators_packed, perm, inv_perm, token_pos_packed, dup_boundary_packed = pack_two_branch_sequence(
+            (
+                hidden_states_packed,
+                indexes_packed,
+                document_ids_packed,
+                modality_indicators_packed,
+                image_gen_indicators_packed,
+                layer_group_indicators_packed,
+                layer_index_indicators_packed,
+                perm,
+                inv_perm,
+                token_pos_packed,
+                dup_boundary_packed,
+            ) = pack_two_branch_sequence(
                 hidden_states=hidden_states,
                 indexes=indexes,
                 document_ids=document_ids,
                 modality_indicators=modality_indicators,
                 image_gen_indicators=image_gen_indicators,
+                layer_group_indicators=layer_group_indicators,
+                layer_index_indicators=layer_index_indicators,
                 dup_boundary=dup_boundary,
             )
 
@@ -1156,6 +2122,25 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     dim=0
                 )
 
+                pad_group = torch.full(
+                    (pad_dummy_image_num,),
+                    -1,
+                    device=layer_group_indicators_packed.device,
+                    dtype=layer_group_indicators_packed.dtype,
+                )
+                layer_group_indicators_packed = torch.cat(
+                    [pad_group, layer_group_indicators_packed], dim=0
+                )
+
+                pad_layer_index = torch.zeros(
+                    (pad_dummy_image_num,),
+                    device=layer_index_indicators_packed.device,
+                    dtype=layer_index_indicators_packed.dtype,
+                )
+                layer_index_indicators_packed = torch.cat(
+                    [pad_layer_index, layer_index_indicators_packed], dim=0
+                )
+
                 pad_dup_boundary = torch.zeros(
                     (pad_dummy_image_num, ),
                     device=dup_boundary_packed.device,
@@ -1173,7 +2158,20 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                 )
                 token_pos_packed = torch.cat([pad_pos, token_pos_packed], dim=0)
 
-            flex_mask, padlen = create_flex_mask_padding_image_gen(document_ids_packed, modality_indicators=modality_indicators_packed, image_gen_indicators=image_gen_indicators_packed.view(-1), token_pos=token_pos_packed, dup_boundary=dup_boundary_packed, div_num=128, compile_mask=True)
+            flex_mask, padlen = create_flex_mask_padding_image_gen(
+                document_ids_packed,
+                modality_indicators=modality_indicators_packed,
+                image_gen_indicators=image_gen_indicators_packed.view(-1),
+                layer_group_indicators=layer_group_indicators_packed,
+                layer_prefix_positions=(
+                    indexes_packed[:, 0]
+                    - layer_index_indicators_packed.to(indexes_packed.dtype)
+                ),
+                token_pos=token_pos_packed,
+                dup_boundary=dup_boundary_packed,
+                div_num=128,
+                compile_mask=True,
+            )
 
             def _build_cu_seqlens_from_doc_ids(doc_ids: torch.Tensor) -> torch.Tensor:
                 if doc_ids.numel() == 0:
@@ -1437,9 +2435,21 @@ class SenseNovaVLChatMoTModel(PreTrainedModel):
                     w_tok = int(hw[1] // merge_size)
                     img_2d = pixels_1d.view(1, h_tok, w_tok, -1).permute(0, 3, 1, 2).contiguous()
                     decoded = self.fm_modules["fm_head"](img_2d)
-                    decoded = decoded.view(1, 3, h_tok, patch_size, w_tok, patch_size)
+                    decoded = decoded.view(
+                        1,
+                        self.image_gen_channels,
+                        h_tok,
+                        patch_size,
+                        w_tok,
+                        patch_size,
+                    )
                     decoded = torch.einsum("b c h p w q -> b h w p q c", decoded)
-                    out_1d_list.append(decoded.contiguous().view(-1, patch_size * patch_size * 3))
+                    out_1d_list.append(
+                        decoded.contiguous().view(
+                            -1,
+                            patch_size * patch_size * self.image_gen_channels,
+                        )
+                    )
                 image_gen_pred_x = torch.cat(out_1d_list, dim=0)
             else:
                 image_gen_pred_x = self.fm_modules['fm_head'](image_gen_hidden_states)

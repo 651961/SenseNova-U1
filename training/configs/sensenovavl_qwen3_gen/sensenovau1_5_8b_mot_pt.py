@@ -128,6 +128,9 @@ noise_scale_base_image_seq_len = int(os.environ.get('noise_scale_base_image_seq_
 noise_scale_max_value = float(os.environ.get('noise_scale_max_value', 8))
 add_noise_scale_embedding = env_bool('add_noise_scale_embedding', False)
 use_pixel_head = env_bool('use_pixel_head', False)
+output_channels = int(os.environ.get('output_channels', 3))
+if output_channels not in (3, 4):
+    raise ValueError(f'output_channels must be 3 or 4, got {output_channels}')
 
 # Classifier-free guidance unconditional-drop probabilities (applied per sample).
 cfg_txt_uncond_drop_prob = float(os.environ.get('cfg_txt_uncond_drop_prob', 0.1))
@@ -356,6 +359,7 @@ model = dict(
     fm_head_layers=2,
     fm_head_mlp_ratio=1,
     use_pixel_head=use_pixel_head,
+    output_channels=output_channels,
     # ViT adapter (zero local layers; pretrained ViT weights come from HF).
     vit_cfg=dict(
         num_hidden_layers=0,

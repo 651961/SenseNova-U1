@@ -93,10 +93,26 @@ class InternVisionEmbeddings(nn.Module):
         self.downsample_factor = int(1 / config.downsample_ratio[0])
         self.image_size = config.image_size
         self.patch_size = config.patch_size
+        self.split_alpha_embedding = bool(
+            config.num_channels == 4
+            and getattr(config, "split_alpha_embedding", False)
+        )
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            in_channels=3 if self.split_alpha_embedding else config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
         )
+        if self.split_alpha_embedding:
+            self.alpha_patch_embedding = nn.Conv2d(
+                in_channels=1,
+                out_channels=self.embed_dim,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+                bias=False,
+            )
+            nn.init.zeros_(self.alpha_patch_embedding.weight)
         self.dense_embedding = nn.Conv2d(
             in_channels=self.embed_dim, out_channels=self.llm_embed_dim, kernel_size=self.downsample_factor, stride=self.downsample_factor
         )
@@ -124,6 +140,10 @@ class InternVisionEmbeddings(nn.Module):
 
         # set parallel attributes
         set_parallel_attribute(self.patch_embedding, IS_REPLICA_ZERO_PARALLEL)
+        if self.split_alpha_embedding:
+            set_parallel_attribute(
+                self.alpha_patch_embedding, IS_REPLICA_ZERO_PARALLEL
+            )
         set_parallel_attribute(self.dense_embedding, IS_REPLICA_ZERO_PARALLEL)
 
     def _apply_2d_rotary_pos_emb(self, patch_embeds, grid_hw):
@@ -143,8 +163,17 @@ class InternVisionEmbeddings(nn.Module):
     def forward(self, pixel_values: torch.FloatTensor, grid_hw=None) -> torch.Tensor:
         assert pixel_values.dim() == 2, f"pixel_values must be 2D for native resolution, got: {pixel_values.dim()}"
 
-        pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)  # [N_total, 768] -> [N_total, 3, 16, 16]
-        patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
+        pixel_values = pixel_values.view(
+            -1, self.config.num_channels, self.patch_size, self.patch_size
+        )
+        if self.split_alpha_embedding:
+            patch_values = self.patch_embedding(pixel_values[:, :3])
+            patch_values = patch_values + self.alpha_patch_embedding(
+                pixel_values[:, 3:4]
+            )
+        else:
+            patch_values = self.patch_embedding(pixel_values)
+        patch_embeds = self.gelu(patch_values).view(-1, self.embed_dim)
         current_device = get_current_device()
         if self.add_pos_embedding:
             self.cos_cached_x = self.cos_cached_x.to(current_device)

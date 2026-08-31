@@ -283,7 +283,10 @@ class NEOInferenceEngine:
         print("Model loaded successfully!")
 
     def _denorm(self, x: torch.Tensor, mean=NORM_MEAN, std=NORM_STD) -> torch.Tensor:
-        """Denormalize tensor: x: [B,3,H,W] normalized -> [0,1] clamped"""
+        """Denormalize the visible RGB channels of an RGB/RGBA model output."""
+        if x.ndim != 4 or x.shape[1] not in (3, 4):
+            raise ValueError(f"Expected an RGB/RGBA batch shaped [B, C, H, W], got {tuple(x.shape)}.")
+        x = x[:, :3]
         mean = torch.tensor(mean, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         std = torch.tensor(std, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         return (x * std + mean).clamp(0, 1)

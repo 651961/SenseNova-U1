@@ -108,6 +108,7 @@ def get_model(model_args, data_args):
         fm_head_layers=model_args.fm_head_layers,
         fm_head_mlp_ratio=model_args.fm_head_mlp_ratio,
         use_pixel_head=model_args.get("use_pixel_head", False),
+        output_channels=model_args.get("output_channels", 3),
         extra_num_layers_post=model_args.extra_num_layers_post,
     )
 

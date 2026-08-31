@@ -10,6 +10,29 @@ from .configuration_neo_vit import NEOVisionConfig
 logger = logging.get_logger(__name__)
 
 
+def _normalize_output_channels(output_channels):
+    """Normalize and validate the image-generation channel count.
+
+    ``output_channels`` was introduced after the original RGB-only model.
+    Checkpoints produced by older tooling can therefore contain an explicit
+    JSON ``null`` value; that value is equivalent to omitting the option and
+    must resolve to the legacy three-channel default.
+    """
+    if output_channels is None:
+        output_channels = 3
+    try:
+        output_channels = int(output_channels)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"output_channels must be 3 (RGB) or 4 (RGBA), got {output_channels!r}."
+        ) from exc
+    if output_channels not in (3, 4):
+        raise ValueError(
+            f"output_channels must be 3 (RGB) or 4 (RGBA), got {output_channels}."
+        )
+    return output_channels
+
+
 def _restore_legacy_rope_theta(config) -> None:
     """Expose the v4 rope attribute expected by the vendored model code."""
     if hasattr(config, "rope_theta"):
@@ -147,6 +170,7 @@ class NEOChatConfig(PretrainedConfig):
         use_llm_lora=0,
         downsample_ratio=0.5,
         template=None,
+        output_channels=3,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -171,7 +195,24 @@ class NEOChatConfig(PretrainedConfig):
         self.use_llm_lora = use_llm_lora
         self.downsample_ratio = downsample_ratio
         self.template = template
+        self.output_channels = _normalize_output_channels(output_channels)
         self.tie_word_embeddings = self.llm_config.tie_word_embeddings
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        """Build a config while normalizing legacy/null channel metadata.
+
+        ``PretrainedConfig.from_dict`` applies keyword overrides *after* the
+        constructor returns.  Normalize both the serialized dictionary and
+        those overrides so an explicit ``output_channels=None`` cannot put the
+        instance back into an invalid state.
+        """
+        config_dict = copy.deepcopy(config_dict)
+        config_dict["output_channels"] = _normalize_output_channels(config_dict.get("output_channels", 3))
+        if "output_channels" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["output_channels"] = _normalize_output_channels(kwargs["output_channels"])
+        return super().from_dict(config_dict, **kwargs)
 
     @property
     def is_moe_llm(self) -> bool:

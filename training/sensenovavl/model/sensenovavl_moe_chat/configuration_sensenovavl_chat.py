@@ -14,6 +14,26 @@ from .configuration_neo_vit import NEOVisionConfig
 logger = logging.get_logger(__name__)
 
 
+def _normalize_output_channels(output_channels):
+    """Normalize the optional image-generation channel count.
+
+    RGB was the only supported output before layered generation was added.
+    Treat an explicit ``None``/JSON ``null`` as the legacy RGB default while
+    retaining the 3-channel and 4-channel validation used by the model.
+    """
+    if output_channels is None:
+        output_channels = 3
+    try:
+        output_channels = int(output_channels)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"output_channels must be 3 or 4, got {output_channels!r}."
+        ) from exc
+    if output_channels not in (3, 4):
+        raise ValueError(f"output_channels must be 3 or 4, got {output_channels}.")
+    return output_channels
+
+
 class SenseNovaVLChatConfig(PretrainedConfig):
     """
     Config for SenseNovaVL.
@@ -60,6 +80,11 @@ class SenseNovaVLChatConfig(PretrainedConfig):
         fm_head_mlp_ratio=1,
         use_pixel_head=False,
         extra_num_layers_post=0,
+        # Keep this new option after all legacy positional parameters.  Some
+        # downstream training scripts still pass ``extra_num_layers_post``
+        # positionally, and inserting a parameter before it would silently
+        # reinterpret their argument as ``output_channels``.
+        output_channels=3,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -107,6 +132,7 @@ class SenseNovaVLChatConfig(PretrainedConfig):
         self.fm_head_layers = fm_head_layers
         self.fm_head_mlp_ratio = fm_head_mlp_ratio
         self.use_pixel_head = use_pixel_head
+        self.output_channels = _normalize_output_channels(output_channels)
         self.extra_num_layers_post = extra_num_layers_post
 
         logger.info(f"vision_select_layer: {self.select_layer}")
@@ -114,6 +140,21 @@ class SenseNovaVLChatConfig(PretrainedConfig):
         logger.info(f"ps_version: {self.ps_version}")
         logger.info(f"min_dynamic_patch: {self.min_dynamic_patch}")
         logger.info(f"max_dynamic_patch: {self.max_dynamic_patch}")
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        """Normalize channel metadata before and after HF kwarg overrides.
+
+        Hugging Face's base implementation applies overrides after invoking
+        ``__init__``; without this normalization, ``from_pretrained(...,
+        output_channels=None)`` would overwrite the validated RGB default.
+        """
+        config_dict = copy.deepcopy(config_dict)
+        config_dict["output_channels"] = _normalize_output_channels(config_dict.get("output_channels", 3))
+        if "output_channels" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["output_channels"] = _normalize_output_channels(kwargs["output_channels"])
+        return super().from_dict(config_dict, **kwargs)
 
     def to_dict(self):
         """

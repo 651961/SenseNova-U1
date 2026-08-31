@@ -35,6 +35,7 @@ from io import TextIOWrapper
 from sensenovavl.data.dataset import build_transform, dynamic_preprocess_native_resolution
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+TERMINAL_IMAGE_GEN_TYPE_IDS = (3, 4)
 logger = get_logger(__name__, logging_level="info")
 
 # 目前的实现逻辑为两层结构，内层读取数据，外层拼接数据
@@ -246,7 +247,7 @@ class BaseDataset(IterableDataset):
 
     def load_image(self, image_path_or_url):
         try:
-            return Image.open(image_path_or_url).convert("RGB")
+            return Image.open(image_path_or_url).convert("RGBA")
         except Exception as e:
             raise Exception(f"Failed to load image {image_path_or_url}, exception info: {e}")
 
@@ -438,6 +439,15 @@ class ImageTextPairDataset(BaseDataset):
             labels=labels[0],
             pixel_values=pixel_values,
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_for_gen_flags=torch.tensor([0] * num_patches, dtype=torch.bool),
+            image_for_gen_loss_flags=torch.tensor(
+                [0] * num_patches, dtype=torch.bool
+            ),
+            is_image_duplicated_for_und_flags=torch.tensor(
+                [0] * num_patches, dtype=torch.bool
+            ),
+            layer_group_ids=torch.tensor([-1] * num_patches, dtype=torch.long),
+            layer_indices=torch.tensor([-1] * num_patches, dtype=torch.long),
         )
         return ret
 
@@ -643,6 +653,15 @@ class InterleavedDataset(BaseDataset):
             labels=labels[0],
             pixel_values=pixel_values,
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_for_gen_flags=torch.tensor([0] * num_patches, dtype=torch.bool),
+            image_for_gen_loss_flags=torch.tensor(
+                [0] * num_patches, dtype=torch.bool
+            ),
+            is_image_duplicated_for_und_flags=torch.tensor(
+                [0] * num_patches, dtype=torch.bool
+            ),
+            layer_group_ids=torch.tensor([-1] * num_patches, dtype=torch.long),
+            layer_indices=torch.tensor([-1] * num_patches, dtype=torch.long),
         )
         return ret
 
@@ -671,7 +690,15 @@ class InterleavedDataset(BaseDataset):
             for k in sample_to_truncte:
                 if k in ["input_ids", "labels", "attention_mask", "position_ids"]:
                     new_sample[k] = sample_to_truncte[k][start_idx:end_idx]
-                elif k in ["pixel_values", "image_flags"]:
+                elif k in [
+                    "pixel_values",
+                    "image_flags",
+                    "image_for_gen_flags",
+                    "image_for_gen_loss_flags",
+                    "is_image_duplicated_for_und_flags",
+                    "layer_group_ids",
+                    "layer_indices",
+                ]:
                     new_sample[k] = sample_to_truncte[k][start_img_idx:end_img_idx]
                 else:
                     raise NotImplementedError(f"find unsupported keys: {k} from {sample_to_truncte.keys()}")
@@ -740,7 +767,15 @@ class InterleavedDataset(BaseDataset):
                     left_sample[k] = sample_to_split[k][:cut_idx]
                     if right_sample is not None:
                         right_sample[k] = sample_to_split[k][cut_idx:]
-                elif k in ['pixel_values', 'image_flags']:
+                elif k in [
+                    "pixel_values",
+                    "image_flags",
+                    "image_for_gen_flags",
+                    "image_for_gen_loss_flags",
+                    "is_image_duplicated_for_und_flags",
+                    "layer_group_ids",
+                    "layer_indices",
+                ]:
                     left_sample[k] = sample_to_split[k][:cut_img_idx]
                     if right_sample is not None:
                         right_sample[k] = sample_to_split[k][cut_img_idx:]
@@ -1086,11 +1121,84 @@ class PackedDataset(IterableDataset):
             return buffer_list.pop(find_idx)
         return None
 
+    @staticmethod
+    def _normalize_image_layer_metadata(sample):
+        """Make per-image metadata explicit before two samples are packed.
+
+        Older cached/features do not carry ``layer_group_ids`` and
+        ``layer_indices``.  Once such a feature is concatenated with a new
+        layered feature, leaving the fields absent (or only present on one
+        side) either loses the layer relationship or produces arrays whose
+        lengths no longer match the image list.  Give legacy generated images
+        an independent one-layer group while keeping condition/dummy images
+        at ``-1``.
+        """
+
+        pixel_values = sample.get("pixel_values")
+        num_images = 0 if pixel_values is None else len(pixel_values)
+
+        def _field(name, default, dtype):
+            value = sample.get(name)
+            if value is None:
+                value = torch.tensor(default, dtype=dtype)
+            else:
+                value = torch.as_tensor(value, dtype=dtype)
+            if value.ndim != 1 or value.numel() != num_images:
+                raise ValueError(
+                    f"{name} must contain one entry per image: "
+                    f"got shape={tuple(value.shape)}, images={num_images}."
+                )
+            sample[name] = value
+            return value
+
+        image_flags = _field("image_flags", [1] * num_images, torch.long)
+        image_for_gen_flags = _field(
+            "image_for_gen_flags", [0] * num_images, torch.bool
+        )
+        _field(
+            "image_for_gen_loss_flags", [0] * num_images, torch.bool
+        )
+        _field(
+            "is_image_duplicated_for_und_flags", [0] * num_images, torch.bool
+        )
+
+        has_groups = sample.get("layer_group_ids") is not None
+        has_indices = sample.get("layer_indices") is not None
+        if has_groups != has_indices:
+            raise ValueError(
+                "layer_group_ids and layer_indices must either both be present "
+                "or both be absent."
+            )
+        if has_groups:
+            groups = _field("layer_group_ids", None, torch.long)
+            indices = _field("layer_indices", None, torch.long)
+        else:
+            groups = torch.full(
+                (num_images,), -1, dtype=torch.long, device=image_flags.device
+            )
+            indices = torch.full_like(groups, -1)
+            generated = image_for_gen_flags & image_flags.ne(0)
+            groups[generated] = torch.arange(
+                int(generated.sum().item()),
+                dtype=torch.long,
+                device=groups.device,
+            )
+            indices[generated] = 0
+            sample["layer_group_ids"] = groups
+            sample["layer_indices"] = indices
+
+        return sample
+
     def update_buffer(self, buffer, new_sample):
+        # Normalize both sides before concatenating.  This is important when
+        # a resumed/legacy feature (without layer metadata) is mixed with a
+        # newly produced layered feature.
+        new_sample = self._normalize_image_layer_metadata(new_sample)
         if buffer is None:
             new_sample["data_index"] = torch.zeros_like(new_sample["input_ids"])
             return new_sample
 
+        buffer = self._normalize_image_layer_metadata(buffer)
         new_sample["data_index"] = torch.ones_like(new_sample["input_ids"]) + buffer["data_index"][-1].item()
 
         for k in buffer:
@@ -1135,6 +1243,38 @@ class PackedDataset(IterableDataset):
             is_image_end = input_ids[cut_idx].item() == img_end_token_id
             return is_image_start or is_image_token or is_image_end
 
+        def _image_array_boundary(sample, num_valid_images):
+            """Map a span count to an index in the full image arrays.
+
+            ``image_flags == 0`` entries are dummy images and have no image
+            token span.  The old code used the span count directly as an
+            array index, which shifted all metadata as soon as a dummy was
+            present before a real image.
+            """
+
+            pixel_values = sample.get("pixel_values")
+            num_images = 0 if pixel_values is None else len(pixel_values)
+            image_flags = sample.get("image_flags")
+            if image_flags is None:
+                return num_valid_images
+            image_flags = torch.as_tensor(image_flags)
+            if image_flags.ndim != 1 or image_flags.numel() != num_images:
+                raise ValueError(
+                    "image_flags must contain one entry per image while splitting: "
+                    f"flags={tuple(image_flags.shape)}, images={num_images}."
+                )
+            valid_positions = (image_flags != 0).nonzero(as_tuple=True)[0].tolist()
+            if not 0 <= num_valid_images <= len(valid_positions):
+                raise ValueError(
+                    "Image span count does not match image metadata while splitting: "
+                    f"spans={num_valid_images}, valid_images={len(valid_positions)}."
+                )
+            # Include leading/interspersed dummy entries with the document on
+            # their left.  At the end, retain trailing dummies as well.
+            if num_valid_images == len(valid_positions):
+                return num_images
+            return valid_positions[num_valid_images]
+
         def _split(sample_to_split, left_idx, right_idx, left_img_idx, right_img_idx):
             assert (right_idx is None) == (right_img_idx is None)
 
@@ -1152,10 +1292,17 @@ class PackedDataset(IterableDataset):
                     "image_for_gen_flags",
                     "image_for_gen_loss_flags",
                     "is_image_duplicated_for_und_flags",
+                    "layer_group_ids",
+                    "layer_indices",
                 ]:
-                    left_sample[k] = sample_to_split[k][:left_img_idx]
-                    if right_sample is not None:
-                        right_sample[k] = sample_to_split[k][right_img_idx:]
+                    if sample_to_split[k] is None:
+                        left_sample[k] = None
+                        if right_sample is not None:
+                            right_sample[k] = None
+                    else:
+                        left_sample[k] = sample_to_split[k][:left_img_idx]
+                        if right_sample is not None:
+                            right_sample[k] = sample_to_split[k][right_img_idx:]
                 else:
                     raise NotImplementedError(f"find unsupported keys: {k} from {sample_to_split.keys()}")
             return left_sample, right_sample
@@ -1178,22 +1325,65 @@ class PackedDataset(IterableDataset):
             img_end_idx_list = (buffer["input_ids"] == img_end_token_id).nonzero().squeeze(1).tolist()
             assert len(img_start_idx_list) == len(img_end_idx_list)
 
-            if _image_is_splitted(buffer["input_ids"], max_tokens):
+            atomic_doc_start = None
+            if "data_index" in buffer and buffer.get("layer_group_ids") is not None:
+                image_flags = buffer.get("image_flags")
+                if image_flags is None:
+                    num_images = (
+                        0
+                        if buffer.get("pixel_values") is None
+                        else len(buffer["pixel_values"])
+                    )
+                    valid_image_indices = torch.arange(num_images)
+                else:
+                    valid_image_indices = (image_flags != 0).nonzero(
+                        as_tuple=True
+                    )[0]
+                assert len(img_start_idx_list) == valid_image_indices.numel()
+                image_doc_ids = buffer["data_index"][img_start_idx_list]
+                cut_doc_id = buffer["data_index"][max_tokens]
+                doc_group_ids = buffer["layer_group_ids"][valid_image_indices][
+                    image_doc_ids == cut_doc_id
+                ]
+                _, group_counts = torch.unique(
+                    doc_group_ids[doc_group_ids >= 0], return_counts=True
+                )
+                if (group_counts > 1).any():
+                    atomic_doc_start = int(
+                        (buffer["data_index"] == cut_doc_id).nonzero(
+                            as_tuple=True
+                        )[0][0]
+                    )
+                    if atomic_doc_start == 0:
+                        raise ValueError(
+                            "A layered sample exceeds max_packed_tokens and cannot "
+                            "be split without breaking its layer group."
+                        )
+
+            if atomic_doc_start is not None:
+                cut_left_idx = cut_right_idx = atomic_doc_start
+                num_left_valid_images = bisect.bisect_left(
+                    img_start_idx_list, atomic_doc_start
+                )
+                cut_left_img_idx = cut_right_img_idx = _image_array_boundary(
+                    buffer, num_left_valid_images
+                )
+            elif _image_is_splitted(buffer["input_ids"], max_tokens):
                 cut_idx = bisect.bisect_left(img_start_idx_list, max_tokens)
                 if buffer["input_ids"][max_tokens] == img_start_token_id:
                     assert max_tokens == img_start_idx_list[cut_idx]
                     cut_left_idx = img_start_idx_list[cut_idx]
-                    cut_left_img_idx = cut_idx
+                    cut_left_img_idx = _image_array_boundary(buffer, cut_idx)
                 else:
                     cut_left_idx = img_start_idx_list[cut_idx - 1]
-                    cut_left_img_idx = cut_idx - 1
+                    cut_left_img_idx = _image_array_boundary(buffer, cut_idx - 1)
                 cut_right_idx = cut_left_idx
                 cut_right_img_idx = cut_left_img_idx
             else:
                 cut_img_idx = bisect.bisect(img_start_idx_list, max_tokens)
                 if cut_img_idx < len(img_start_idx_list):
                     cut_right_idx = img_start_idx_list[cut_img_idx]
-                    cut_right_img_idx = cut_img_idx
+                    cut_right_img_idx = _image_array_boundary(buffer, cut_img_idx)
                 else:
                     # drop last segment without images
                     cut_right_idx = None
@@ -1201,7 +1391,9 @@ class PackedDataset(IterableDataset):
 
                 cut_left_idx = max_tokens
                 cut_left_img_idx = (
-                    cut_right_img_idx if cut_right_img_idx is not None else len(buffer["pixel_values"])
+                    cut_right_img_idx
+                    if cut_right_img_idx is not None
+                    else (0 if buffer.get("pixel_values") is None else len(buffer["pixel_values"]))
                 )
 
             left, right = _split(
@@ -1212,22 +1404,55 @@ class PackedDataset(IterableDataset):
                 right_img_idx=cut_right_img_idx,
             )
 
-            assert (
-                (left["input_ids"] == img_end_token_id).sum()
-                == (left["input_ids"] == img_start_token_id).sum()
-                == len(left["pixel_values"])
-            )
-            if right is not None:
-                assert (
-                    (right["input_ids"] == img_end_token_id).sum()
-                    == (right["input_ids"] == img_start_token_id).sum()
-                    == len(right["pixel_values"])
+            def _num_valid_images(part):
+                pixel_values = part.get("pixel_values")
+                num_images = 0 if pixel_values is None else len(pixel_values)
+                image_flags = part.get("image_flags")
+                return (
+                    num_images
+                    if image_flags is None
+                    else int(torch.as_tensor(image_flags).ne(0).sum().item())
                 )
 
-            if len(left["pixel_values"]) >= 1 and PackedDataset.check_valid(left):
+            def _assert_image_alignment(part):
+                pixel_values = part.get("pixel_values")
+                num_images = 0 if pixel_values is None else len(pixel_values)
+                num_valid_images = _num_valid_images(part)
+                num_starts = int(
+                    (part["input_ids"] == img_start_token_id).sum().item()
+                )
+                num_ends = int(
+                    (part["input_ids"] == img_end_token_id).sum().item()
+                )
+                assert num_starts == num_ends == num_valid_images, (
+                    "Image spans and per-image metadata are misaligned after "
+                    f"split: starts={num_starts}, ends={num_ends}, "
+                    f"valid_images={num_valid_images}, total_images={num_images}."
+                )
+                for key in (
+                    "image_seq_lens",
+                    "image_flags",
+                    "image_for_gen_flags",
+                    "image_for_gen_loss_flags",
+                    "is_image_duplicated_for_und_flags",
+                    "layer_group_ids",
+                    "layer_indices",
+                ):
+                    if key in part and part[key] is not None:
+                        assert len(part[key]) == num_images, (
+                            f"{key} length {len(part[key])} != image count {num_images}."
+                        )
+
+            _assert_image_alignment(left)
+            if right is not None:
+                _assert_image_alignment(right)
+
+            left_num_valid_images = _num_valid_images(left)
+            if left_num_valid_images >= 1 and PackedDataset.check_valid(left):
                 splitted_buffer.append(left)
 
-            if right is None or len(right["pixel_values"]) == 0:
+            right_num_valid_images = 0 if right is None else _num_valid_images(right)
+            if right is None or right_num_valid_images == 0:
                 break
 
             buffer = right
@@ -1291,9 +1516,26 @@ class PackedDataset(IterableDataset):
         num_pad_images = self.num_images_expected - buffer["pixel_values"].size(0)
         pad_images = torch.stack([torch.zeros_like(buffer["pixel_values"][0]) for _ in range(num_pad_images)])
         pad_image_flags = torch.tensor([0] * num_pad_images, dtype=torch.long)
+        pad_image_gen_flags = torch.tensor([0] * num_pad_images, dtype=torch.bool)
+        pad_layer_ids = torch.tensor([-1] * num_pad_images, dtype=torch.long)
 
         buffer["pixel_values"] = torch.cat([buffer["pixel_values"], pad_images])
         buffer["image_flags"] = torch.cat([buffer["image_flags"], pad_image_flags])
+        buffer["image_for_gen_flags"] = torch.cat(
+            [buffer["image_for_gen_flags"], pad_image_gen_flags]
+        )
+        buffer["image_for_gen_loss_flags"] = torch.cat(
+            [buffer["image_for_gen_loss_flags"], pad_image_gen_flags]
+        )
+        buffer["is_image_duplicated_for_und_flags"] = torch.cat(
+            [buffer["is_image_duplicated_for_und_flags"], pad_image_gen_flags]
+        )
+        buffer["layer_group_ids"] = torch.cat(
+            [buffer["layer_group_ids"], pad_layer_ids]
+        )
+        buffer["layer_indices"] = torch.cat(
+            [buffer["layer_indices"], pad_layer_ids]
+        )
 
         return buffer
 
@@ -1731,6 +1973,87 @@ class PackedDataset(IterableDataset):
 WARNING_CNT = defaultdict(int)
 
 
+def remap_layer_group_ids_for_packed_documents(
+    input_ids,
+    data_index,
+    image_flags,
+    layer_group_ids,
+    img_start_token_id,
+    next_global_layer_group_id,
+):
+    if layer_group_ids is None:
+        return None, next_global_layer_group_id
+
+    image_start_positions = (
+        (input_ids == img_start_token_id).nonzero(as_tuple=True)[0]
+    )
+    valid_image_indices = (image_flags != 0).nonzero(as_tuple=True)[0]
+    if image_start_positions.numel() != valid_image_indices.numel():
+        raise ValueError(
+            "Image starts and metadata must align before remapping layer groups: "
+            f"starts={image_start_positions.numel()}, "
+            f"images={valid_image_indices.numel()}."
+        )
+
+    image_document_ids = data_index[image_start_positions]
+    remapped_group_ids = layer_group_ids.clone()
+    group_id_map = {}
+    for image_i, document_id in zip(
+        valid_image_indices.tolist(), image_document_ids.tolist()
+    ):
+        local_group_id = int(remapped_group_ids[image_i].item())
+        if local_group_id < 0:
+            continue
+        group_key = (document_id, local_group_id)
+        if group_key not in group_id_map:
+            group_id_map[group_key] = next_global_layer_group_id
+            next_global_layer_group_id += 1
+        remapped_group_ids[image_i] = group_id_map[group_key]
+
+    return remapped_group_ids, next_global_layer_group_id
+
+
+def build_image_gen_sequence_keep_mask(
+    input_ids,
+    type_ids,
+    data_index,
+    image_flags,
+    image_for_gen_flags,
+    layer_indices,
+    img_start_token_id,
+    img_end_token_id,
+):
+    """Compact terminal generated layers to the sequence used by inference."""
+
+    keep = torch.ones_like(input_ids, dtype=torch.bool)
+    starts = (input_ids == img_start_token_id).nonzero(as_tuple=True)[0]
+    ends = (input_ids == img_end_token_id).nonzero(as_tuple=True)[0]
+    valid_images = (image_flags != 0).nonzero(as_tuple=True)[0]
+    if starts.numel() != ends.numel() or starts.numel() != valid_images.numel():
+        raise ValueError(
+            "Image boundaries and image metadata must align before compacting "
+            f"generation sequences: starts={starts.numel()}, ends={ends.numel()}, "
+            f"images={valid_images.numel()}."
+        )
+
+    for image_i, start, end in zip(valid_images, starts, ends):
+        if not bool(image_for_gen_flags[image_i]):
+            continue
+        if int(type_ids[start]) not in TERMINAL_IMAGE_GEN_TYPE_IDS:
+            continue
+        if bool(data_index[start] != data_index[end]):
+            raise ValueError("An image generation span crosses packed documents.")
+
+        layer_index = int(layer_indices[image_i])
+        if layer_index < 0:
+            raise ValueError("Generated images require a non-negative layer index.")
+        keep[end] = False
+        if layer_index > 0:
+            keep[start] = False
+
+    return keep
+
+
 # NOTE:
 def internevo_collate_fn(
     features,
@@ -1773,6 +2096,7 @@ def internevo_collate_fn(
 
     num_samples = 0
     num_padding_tokens = 0
+    next_global_layer_group_id = 0
 
     for feat_idx, feat in enumerate(features):
         already_packed = feat.pop('already_packed', False)
@@ -1784,7 +2108,7 @@ def internevo_collate_fn(
 
             for k in ["input_ids", "labels", "type_ids"]:
                 feat[k] = torch.LongTensor(feat[k])
-            for k in ['pixel_values', 'image_seq_lens', 'image_flags', 'image_con_flags', 'image_for_gen_flags', 'image_for_gen_loss_flags', 'is_image_duplicated_for_und_flags']:
+            for k in ['pixel_values', 'image_seq_lens', 'image_flags', 'image_con_flags', 'image_for_gen_flags', 'image_for_gen_loss_flags', 'is_image_duplicated_for_und_flags', 'layer_group_ids', 'layer_indices']:
                 feat[k] = None
 
             # calculate loss weight
@@ -1801,6 +2125,40 @@ def internevo_collate_fn(
         else:
             # NOTE:
             data_index = feat.pop('data_index')
+            has_layer_groups = feat.get("layer_group_ids") is not None
+            has_layer_indices = feat.get("layer_indices") is not None
+            if has_layer_groups != has_layer_indices:
+                raise ValueError(
+                    "layer_group_ids and layer_indices must either both be present "
+                    "or both be absent."
+                )
+            if not has_layer_groups:
+                gen_flags = feat["image_for_gen_flags"].bool()
+                layer_group_ids = torch.full_like(
+                    feat["image_flags"], -1, dtype=torch.long
+                )
+                layer_indices = torch.full_like(
+                    feat["image_flags"], -1, dtype=torch.long
+                )
+                layer_group_ids[gen_flags] = torch.arange(
+                    int(gen_flags.sum().item()),
+                    dtype=torch.long,
+                    device=layer_group_ids.device,
+                )
+                layer_indices[gen_flags] = 0
+                feat["layer_group_ids"] = layer_group_ids
+                feat["layer_indices"] = layer_indices
+            (
+                feat["layer_group_ids"],
+                next_global_layer_group_id,
+            ) = remap_layer_group_ids_for_packed_documents(
+                input_ids=feat["input_ids"],
+                data_index=data_index,
+                image_flags=feat["image_flags"],
+                layer_group_ids=feat.get("layer_group_ids"),
+                img_start_token_id=img_start_token_id,
+                next_global_layer_group_id=next_global_layer_group_id,
+            )
             curr_cu_seqlens, curr_indexes, curr_image_con_flags, curr_loss_weight = PackedDataset.get_cu_seqlens_and_indexes(
                 data_index=data_index,
                 input_ids=feat['input_ids'],
@@ -1813,6 +2171,39 @@ def internevo_collate_fn(
                 ignored_token_ids=ignored_token_ids,
                 len2weight=len2weight,
             )
+            keep = build_image_gen_sequence_keep_mask(
+                input_ids=feat["input_ids"],
+                type_ids=feat["type_ids"],
+                data_index=data_index,
+                image_flags=feat["image_flags"],
+                image_for_gen_flags=feat["image_for_gen_flags"],
+                layer_indices=feat["layer_indices"],
+                img_start_token_id=img_start_token_id,
+                img_end_token_id=img_end_token_id,
+            )
+            if not bool(keep.all()):
+                for key in (
+                    "input_ids",
+                    "labels",
+                    "attention_mask",
+                    "position_ids",
+                    "type_ids",
+                ):
+                    if key in feat:
+                        feat[key] = feat[key][keep]
+                curr_indexes = torch.as_tensor(curr_indexes)[keep].tolist()
+                curr_loss_weight = curr_loss_weight[keep]
+                compacted_data_index = data_index[keep]
+                _, document_lengths = torch.unique_consecutive(
+                    compacted_data_index,
+                    return_counts=True,
+                )
+                curr_cu_seqlens = torch.cat(
+                    [
+                        document_lengths.new_zeros(1),
+                        document_lengths.cumsum(0),
+                    ]
+                ).tolist()
             # shift labels and loss weights
             feat['labels'] = torch.cat(
                 [
@@ -1863,6 +2254,8 @@ def internevo_collate_fn(
     concat_image_for_gen_flags = batch.pop("image_for_gen_flags")
     concat_image_for_gen_loss_flags = batch.pop("image_for_gen_loss_flags")
     concat_is_image_duplicated_for_und_flags = batch.pop("is_image_duplicated_for_und_flags", None)
+    concat_layer_group_ids = batch.pop("layer_group_ids")
+    concat_layer_indices = batch.pop("layer_indices")
     concat_image_con_flags = batch.pop("image_con_flags")
 
     if concat_pixel_values is not None:
@@ -1870,6 +2263,8 @@ def internevo_collate_fn(
         assert concat_image_flags.size(0) == cu_num_images_list[-1]
         assert concat_image_for_gen_flags.size(0) == cu_num_images_list[-1]
         assert concat_image_for_gen_loss_flags.size(0) == cu_num_images_list[-1]
+        assert concat_layer_group_ids.size(0) == cu_num_images_list[-1]
+        assert concat_layer_indices.size(0) == cu_num_images_list[-1]
 
         images = []
         image_seq_lens = []
@@ -1878,6 +2273,8 @@ def internevo_collate_fn(
         image_for_gen_flags = []
         image_for_gen_loss_flags = []
         is_image_duplicated_for_und_flags = []
+        layer_group_ids = []
+        layer_indices = []
         image_grid_hw = []
             
         for i in range(len(features)):
@@ -1903,6 +2300,16 @@ def internevo_collate_fn(
             image_for_gen_loss_flags.append(concat_image_for_gen_loss_flags[cu_num_images_list[i]:cu_num_images_list[i+1]])
             if concat_is_image_duplicated_for_und_flags is not None:
                 is_image_duplicated_for_und_flags.append(concat_is_image_duplicated_for_und_flags[cu_num_images_list[i]:cu_num_images_list[i+1]])
+            layer_group_ids.append(
+                concat_layer_group_ids[
+                    cu_num_images_list[i] : cu_num_images_list[i + 1]
+                ]
+            )
+            layer_indices.append(
+                concat_layer_indices[
+                    cu_num_images_list[i] : cu_num_images_list[i + 1]
+                ]
+            )
             image_con_flags.append(None) #concat_image_con_flags[cu_num_images_list[i]:cu_num_images_list[i+1]])
     else:
         images = [None  for _ in range(len(features))]
@@ -1911,6 +2318,8 @@ def internevo_collate_fn(
         image_for_gen_flags =[None  for _ in range(len(features))]
         image_for_gen_loss_flags = [None  for _ in range(len(features))]
         is_image_duplicated_for_und_flags = [None  for _ in range(len(features))]
+        layer_group_ids = [None for _ in range(len(features))]
+        layer_indices = [None for _ in range(len(features))]
         image_con_flags = [None for _ in range(len(features))]
         image_grid_hw = [None for _ in range(len(features))]
 
@@ -1928,6 +2337,8 @@ def internevo_collate_fn(
         "image_for_gen_flags": image_for_gen_flags,
         "image_for_gen_loss_flags": image_for_gen_loss_flags,
         "is_image_duplicated_for_und_flags": is_image_duplicated_for_und_flags,
+        "layer_group_ids": layer_group_ids,
+        "layer_indices": layer_indices,
         "cu_seqlens": cu_seqlens,
         "indexes": indexes,
         "type_ids": type_ids,

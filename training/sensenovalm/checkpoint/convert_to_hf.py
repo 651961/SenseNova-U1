@@ -294,6 +294,14 @@ def save_config(tgt):
     origin_config["vision_config"]["image_size"] = data_config["image_size"]
     origin_config["force_image_size"] = data_config["force_image_size"]
     origin_config["downsample_ratio"] = data_config["down_sample_ratio"]
+    # ``output_channels`` was added after the original RGB checkpoints.  A
+    # config assembled by older code (or one carrying an explicit JSON null)
+    # must still produce a valid Hugging Face config, so normalize ``None`` to
+    # the legacy three-channel default.
+    output_channels = model_config.get("output_channels", 3)
+    if output_channels is None:
+        output_channels = 3
+    origin_config["output_channels"] = output_channels
 
     def custom_serializer(obj):
         if isinstance(obj, torch.dtype):

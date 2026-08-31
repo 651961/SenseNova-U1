@@ -121,10 +121,27 @@ class NEOVisionEmbeddings(nn.Module):
         self.llm_embed_dim = config.llm_hidden_size[0]
         self.downsample_factor = int(1 / config.downsample_ratio[0])
         self.patch_size = config.patch_size
+        self.split_alpha_embedding = bool(
+            config.num_channels == 4
+            and getattr(config, "split_alpha_embedding", False)
+        )
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            in_channels=3 if self.split_alpha_embedding else config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
         )
+        if self.split_alpha_embedding:
+            # Preserve the pretrained RGB kernel and learn alpha separately.
+            self.alpha_patch_embedding = nn.Conv2d(
+                in_channels=1,
+                out_channels=self.embed_dim,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+                bias=False,
+            )
+            nn.init.zeros_(self.alpha_patch_embedding.weight)
         self.dense_embedding = nn.Conv2d(
             in_channels=self.embed_dim, out_channels=self.llm_embed_dim, kernel_size=self.downsample_factor, stride=self.downsample_factor
         )
@@ -174,14 +191,26 @@ class NEOVisionEmbeddings(nn.Module):
         return embeddings
         
     def forward(self, pixel_values: torch.FloatTensor, grid_hw=None) -> torch.Tensor:
-        
-        pixel_values = pixel_values.view(  # 
+        expected_width = self.config.num_channels * self.patch_size**2
+        if pixel_values.ndim != 2 or pixel_values.shape[-1] != expected_width:
+            raise ValueError(
+                f"Expected packed vision patches shaped [N, {expected_width}], "
+                f"got {tuple(pixel_values.shape)}."
+            )
+        pixel_values = pixel_values.view(
             -1,
-            3,
+            self.config.num_channels,
             self.patch_size,
             self.patch_size,
-        )   #  [28072, 768] -> [28072, 3, 16, 16]
-        patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
+        )
+        if self.split_alpha_embedding:
+            patch_values = self.patch_embedding(pixel_values[:, :3])
+            patch_values = patch_values + self.alpha_patch_embedding(
+                pixel_values[:, 3:4]
+            )
+        else:
+            patch_values = self.patch_embedding(pixel_values)
+        patch_embeds = self.gelu(patch_values).view(-1, self.embed_dim)
         self._ensure_rope_cache(patch_embeds.device)
         patch_embeds = self._apply_2d_rotary_pos_emb(patch_embeds, grid_hw) # [28072, 1024]
         assert (grid_hw[:,0] * grid_hw[:,1]).sum() == patch_embeds.shape[0]

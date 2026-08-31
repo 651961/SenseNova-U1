@@ -29,8 +29,8 @@ from sensenova_u1.utils import (
     vram_mode_to_prefetch_count,
 )
 
-NORM_MEAN = (0.5, 0.5, 0.5)
-NORM_STD = (0.5, 0.5, 0.5)
+NORM_MEAN = (0.5, 0.5, 0.5, 0.5)
+NORM_STD = (0.5, 0.5, 0.5, 0.5)
 
 DEFAULT_SEED = 42
 
@@ -116,16 +116,23 @@ def smart_resize(
 
 
 def _denorm(x: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor(NORM_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(NORM_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    if x.ndim != 4 or x.shape[1] not in (3, 4):
+        raise ValueError(f"Expected [B, C, H, W] with C=3 or C=4, got {tuple(x.shape)}.")
+    channels = x.shape[1]
+    mean = torch.tensor(NORM_MEAN[:channels], device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
+    std = torch.tensor(NORM_STD[:channels], device=x.device, dtype=x.dtype).view(1, channels, 1, 1)
     return (x * std + mean).clamp(0, 1)
 
 
 def _to_pil(batch: torch.Tensor) -> Image.Image:
-    """Convert a single [1, 3, H, W] normalized tensor to a PIL image."""
-    arr = _denorm(batch.float()).permute(0, 2, 3, 1).cpu().numpy()
+    """Convert one RGB/RGBA tensor to a visible RGB image, ignoring alpha."""
+    if batch.ndim != 4 or batch.shape[0] != 1 or batch.shape[1] not in (3, 4):
+        raise ValueError(
+            f"Expected a generated image with shape [1, 3|4, H, W], got {tuple(batch.shape)}."
+        )
+    arr = _denorm(batch.float()).permute(0, 2, 3, 1).detach().cpu().numpy()
     arr = (arr * 255.0).round().astype(np.uint8)
-    return Image.fromarray(arr[0])
+    return Image.fromarray(arr[0, :, :, :3])
 
 
 class SenseNovaU1Interleave:

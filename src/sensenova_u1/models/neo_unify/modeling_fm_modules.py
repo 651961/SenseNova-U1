@@ -570,9 +570,92 @@ class PatchDecoder_preps1(nn.Module):
         x = self.ps3(self.conv2(self.ps2((x)))) # -> [B, 256, H/8, W/8]
         return x
 
+class _CheckpointCompatibleConv2d(nn.Conv2d):
+    """Load RGB pixel-head rows into an RGB/RGBA convolution.
+
+    ``transformers`` may load safetensor checkpoints one parameter at a time
+    while the destination module is still on ``meta``.  In that path the
+    parent ``ConvDecoder`` state-dict hook is bypassed, so the output
+    convolution itself must handle the legacy RGB (192-row) versus RGBA
+    (256-row) shape difference.
+    """
+
+    _rgb_rows = 3 * 8**2
+    _rgba_rows = 4 * 8**2
+
+    @classmethod
+    def _adapt_checkpoint_value(cls, value, target):
+        if target is None or value.shape == target.shape:
+            return value
+        # Only adapt the output-row dimension of the pixel-head convolution;
+        # unrelated shape mismatches should retain PyTorch's normal error.
+        if value.ndim != target.ndim or value.ndim == 0 or value.shape[1:] != target.shape[1:]:
+            return value
+        if value.shape[0] == cls._rgb_rows and target.shape[0] == cls._rgba_rows:
+            expanded = value.new_zeros(target.shape)
+            expanded[: cls._rgb_rows].copy_(value)
+            return expanded
+        if value.shape[0] == cls._rgba_rows and target.shape[0] == cls._rgb_rows:
+            return value[: cls._rgb_rows].contiguous()
+        return value
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        for name in ("weight", "bias"):
+            key = f"{prefix}{name}"
+            value = state_dict.get(key)
+            if value is not None:
+                target = getattr(self, name, None)
+                adapted = self._adapt_checkpoint_value(value, target)
+                if adapted is not value:
+                    state_dict[key] = adapted
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
 class ConvDecoder(nn.Module):
-    def __init__(self, input_dim=4096, hidden_dim=1024):
+    """Decode image tokens with a checkpoint-compatible RGB/RGBA head."""
+
+    final_upscale = 8
+    rgb_channels = 3
+
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=1024,
+        out_channels=3,
+        *,
+        output_channels=None,
+    ):
         super().__init__()
+        if output_channels is not None:
+            if out_channels != 3 and out_channels != output_channels:
+                raise ValueError(
+                    "out_channels and output_channels specify different values."
+                )
+            out_channels = output_channels
+        if out_channels not in (3, 4):
+            raise ValueError(
+                f"ConvDecoder supports 3 or 4 output channels, got {out_channels}."
+            )
+        self.out_channels = out_channels
+        self.output_channels = out_channels
+
         # layer 1: H/32 -> H/16 (2x upscale)
         self.ps1 = nn.PixelShuffle(2)
         self.conv1 = nn.Conv2d(input_dim // 4, hidden_dim, kernel_size=3, padding=1)
@@ -580,12 +663,86 @@ class ConvDecoder(nn.Module):
 
         # layer 2: H/16 -> H/8 (2x upscale)
         self.ps2 = nn.PixelShuffle(2)
-        self.conv2 = nn.Conv2d(hidden_dim // 4, 192, kernel_size=3, padding=1)
+        self.conv2 = _CheckpointCompatibleConv2d(
+            hidden_dim // 4,
+            out_channels * self.final_upscale**2,
+            kernel_size=3,
+            padding=1,
+        )
+        if out_channels == 4:
+            alpha_start = self.rgb_channels * self.final_upscale**2
+            nn.init.zeros_(self.conv2.weight[alpha_start:])
+            nn.init.zeros_(self.conv2.bias[alpha_start:])
 
         # layer 3: H/8 -> H (8x upscale)
-        self.ps3 = nn.PixelShuffle(8)
+        self.ps3 = nn.PixelShuffle(self.final_upscale)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Expand RGB or legacy split-alpha weights into the combined head."""
+
+        weight_key = f"{prefix}conv2.weight"
+        bias_key = f"{prefix}conv2.bias"
+        alpha_weight_key = f"{prefix}alpha_conv.weight"
+        alpha_bias_key = f"{prefix}alpha_conv.bias"
+        rgb_rows = self.rgb_channels * self.final_upscale**2
+
+        source_weight = state_dict.get(weight_key)
+        if (
+            self.output_channels == 4
+            and source_weight is not None
+            and source_weight.shape[0] == rgb_rows
+        ):
+            expanded_weight = source_weight.new_zeros(self.conv2.weight.shape)
+            expanded_weight[:rgb_rows].copy_(source_weight)
+            legacy_alpha_weight = state_dict.pop(alpha_weight_key, None)
+            if legacy_alpha_weight is not None:
+                alpha_weight = expanded_weight[rgb_rows:]
+                if legacy_alpha_weight.shape != alpha_weight.shape:
+                    error_msgs.append(
+                        f"size mismatch for {alpha_weight_key}: expected "
+                        f"{tuple(alpha_weight.shape)}, got "
+                        f"{tuple(legacy_alpha_weight.shape)}"
+                    )
+                else:
+                    alpha_weight.copy_(legacy_alpha_weight)
+            state_dict[weight_key] = expanded_weight
+
+            source_bias = state_dict.get(bias_key)
+            if source_bias is not None and source_bias.shape[0] == rgb_rows:
+                expanded_bias = source_bias.new_zeros(self.conv2.bias.shape)
+                expanded_bias[:rgb_rows].copy_(source_bias)
+                legacy_alpha_bias = state_dict.pop(alpha_bias_key, None)
+                if legacy_alpha_bias is not None:
+                    alpha_bias = expanded_bias[rgb_rows:]
+                    if legacy_alpha_bias.shape != alpha_bias.shape:
+                        error_msgs.append(
+                            f"size mismatch for {alpha_bias_key}: expected "
+                            f"{tuple(alpha_bias.shape)}, got "
+                            f"{tuple(legacy_alpha_bias.shape)}"
+                        )
+                    else:
+                        alpha_bias.copy_(legacy_alpha_bias)
+                state_dict[bias_key] = expanded_bias
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x):
-        x = self.act1(self.conv1(self.ps1((x))))
-        x = self.ps3(self.conv2(self.ps2((x))))
-        return x
+        x = self.act1(self.conv1(self.ps1(x)))
+        return self.ps3(self.conv2(self.ps2(x)))
